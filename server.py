@@ -224,9 +224,9 @@ async def move_mouse(
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
     if mode == "absolute":
-        cmd = f"DISPLAY={VM_DISPLAY} xdotool mousemove {x} {y}"
+        cmd = f"DISPLAY={VM_DISPLAY} xdotool mousemove --sync {x} {y}"
     elif mode == "relative":
-        cmd = f"DISPLAY={VM_DISPLAY} xdotool mousemove_relative {x} {y}"
+        cmd = f"DISPLAY={VM_DISPLAY} xdotool mousemove_relative --sync {x} {y}"
     else:
         raise ValueError("mode must be 'absolute' or 'relative'")
 
@@ -369,9 +369,9 @@ async def run_actions(
                 y = action_def.get("y", 0)
                 mode = action_def.get("mode", "absolute")
                 if mode == "absolute":
-                    cmd = f"DISPLAY={VM_DISPLAY} xdotool mousemove {x} {y}"
+                    cmd = f"DISPLAY={VM_DISPLAY} xdotool mousemove --sync {x} {y}"
                 else:
-                    cmd = f"DISPLAY={VM_DISPLAY} xdotool mousemove_relative {x} {y}"
+                    cmd = f"DISPLAY={VM_DISPLAY} xdotool mousemove_relative --sync {x} {y}"
                 await run_vm_cmd(ssh, cmd)
                 results.append(f"{i + 1}. move_mouse ({x}, {y}) [{mode}]")
 
