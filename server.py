@@ -1,16 +1,16 @@
 import asyncio
-import base64
 import datetime as dt
 import json
 import os
 import pathlib
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Optional
 
 import asyncssh
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
-from mcp.types import Resource, CallToolResult, TextContent, ImageContent
 
 # ---------- Config ----------
 VM_HOST = os.getenv("VM_HOST", "192.168.122.79")
@@ -25,9 +25,11 @@ PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------- Project Management ----------
 
+
 @dataclass
 class Project:
     """Manages a project's folder structure and metadata."""
+
     name: str
     path: pathlib.Path
     created_at: str
@@ -135,11 +137,13 @@ class Project:
             lines = content.strip().split("\n")
             title = lines[0].lstrip("# ").strip() if lines else advice_file.stem
             body = "\n".join(lines[2:]).strip() if len(lines) > 2 else ""
-            advice_list.append({
-                "title": title,
-                "content": body,
-                "file": advice_file.name,
-            })
+            advice_list.append(
+                {
+                    "title": title,
+                    "content": body,
+                    "file": advice_file.name,
+                }
+            )
         return advice_list
 
     def get_info(self) -> dict:
@@ -158,6 +162,7 @@ class Project:
             "result_count": len(results),
             "log_entries": log_lines,
         }
+
 
 # ---------- SSH connection management ----------
 
@@ -188,9 +193,6 @@ async def run_vm_cmd(ssh: asyncssh.SSHClientConnection, cmd: str) -> str:
 
 
 # ---------- MCP server setup ----------
-
-from contextlib import asynccontextmanager
-from collections.abc import AsyncIterator
 
 
 @asynccontextmanager
@@ -344,14 +346,14 @@ async def run_actions(
                 combo = "+".join(k.lower() for k in keys)
                 cmd = f"DISPLAY={VM_DISPLAY} xdotool key {combo}"
                 await run_vm_cmd(ssh, cmd)
-                results.append(f"{i+1}. press_keys {keys}")
+                results.append(f"{i + 1}. press_keys {keys}")
 
             elif action_type == "type_text":
                 text = action_def.get("text", "")
-                escaped = text.replace('"', r'\"')
+                escaped = text.replace('"', r"\"")
                 cmd = f'DISPLAY={VM_DISPLAY} xdotool type --delay 10 "{escaped}"'
                 await run_vm_cmd(ssh, cmd)
-                results.append(f"{i+1}. type_text ({len(text)} chars)")
+                results.append(f"{i + 1}. type_text ({len(text)} chars)")
 
             elif action_type == "click":
                 button = action_def.get("button", "left")
@@ -360,7 +362,7 @@ async def run_actions(
                 btn_num = button_map.get(button, 1)
                 cmd = f"DISPLAY={VM_DISPLAY} xdotool click --repeat {count} {btn_num}"
                 await run_vm_cmd(ssh, cmd)
-                results.append(f"{i+1}. click {button} x{count}")
+                results.append(f"{i + 1}. click {button} x{count}")
 
             elif action_type == "move_mouse":
                 x = action_def.get("x", 0)
@@ -371,22 +373,24 @@ async def run_actions(
                 else:
                     cmd = f"DISPLAY={VM_DISPLAY} xdotool mousemove_relative {x} {y}"
                 await run_vm_cmd(ssh, cmd)
-                results.append(f"{i+1}. move_mouse ({x}, {y}) [{mode}]")
+                results.append(f"{i + 1}. move_mouse ({x}, {y}) [{mode}]")
 
             elif action_type == "wait":
                 seconds = action_def.get("seconds", 0.5)
                 await asyncio.sleep(seconds)
-                results.append(f"{i+1}. wait {seconds}s")
+                results.append(f"{i + 1}. wait {seconds}s")
 
             else:
-                results.append(f"{i+1}. UNKNOWN ACTION: {action_type}")
+                results.append(f"{i + 1}. UNKNOWN ACTION: {action_type}")
 
         except Exception as e:
-            results.append(f"{i+1}. ERROR in {action_type}: {str(e)}")
-            _log_error(ctx, "run_actions", f"Action {i+1} ({action_type}): {str(e)}")
+            results.append(f"{i + 1}. ERROR in {action_type}: {str(e)}")
+            _log_error(ctx, "run_actions", f"Action {i + 1} ({action_type}): {str(e)}")
             break  # Stop on error
 
-    _log_tool_call(ctx, "run_actions", {"count": len(actions)}, f"executed {len(results)} actions")
+    _log_tool_call(
+        ctx, "run_actions", {"count": len(actions)}, f"executed {len(results)} actions"
+    )
     return f"Executed {len(results)} actions:\n" + "\n".join(results)
 
 
@@ -419,12 +423,23 @@ async def ssh_execute(
             output_parts.append(f"STDERR:\n{result.stderr}")
         if result.returncode != 0:
             output_parts.append(f"EXIT CODE: {result.returncode}")
-            _log_tool_call(ctx, "ssh_execute", {"command": command}, f"exit_code={result.returncode}")
-            _log_error(ctx, "ssh_execute", f"Command failed with exit code {result.returncode}")
+            _log_tool_call(
+                ctx,
+                "ssh_execute",
+                {"command": command},
+                f"exit_code={result.returncode}",
+            )
+            _log_error(
+                ctx, "ssh_execute", f"Command failed with exit code {result.returncode}"
+            )
         else:
             _log_tool_call(ctx, "ssh_execute", {"command": command}, "success")
 
-        return "\n\n".join(output_parts) if output_parts else "Command completed (no output)"
+        return (
+            "\n\n".join(output_parts)
+            if output_parts
+            else "Command completed (no output)"
+        )
     except Exception as e:
         _log_error(ctx, "ssh_execute", str(e))
         return f"Error executing command: {str(e)}"
@@ -457,7 +472,12 @@ async def ssh_upload(
         async with ssh.start_sftp_client() as sftp:
             await sftp.put(str(local_file), remote_path)
 
-        _log_tool_call(ctx, "ssh_upload", {"local_path": local_path, "remote_path": remote_path}, "success")
+        _log_tool_call(
+            ctx,
+            "ssh_upload",
+            {"local_path": local_path, "remote_path": remote_path},
+            "success",
+        )
         return f"Successfully uploaded {local_path} to {remote_path}"
     except Exception as e:
         _log_error(ctx, "ssh_upload", str(e))
@@ -490,7 +510,12 @@ async def ssh_download(
         async with ssh.start_sftp_client() as sftp:
             await sftp.get(remote_path, str(local_file))
 
-        _log_tool_call(ctx, "ssh_download", {"remote_path": remote_path, "local_path": local_path}, "success")
+        _log_tool_call(
+            ctx,
+            "ssh_download",
+            {"remote_path": remote_path, "local_path": local_path},
+            "success",
+        )
         return f"Successfully downloaded {remote_path} to {local_path}"
     except Exception as e:
         _log_error(ctx, "ssh_download", str(e))
@@ -525,7 +550,7 @@ Port: {VM_PORT}
 User: {VM_USER}
 Display: {VM_DISPLAY}
 Status: {status}
-Identity File: {VM_IDENTITY if VM_IDENTITY else 'Not specified (using password/agent)'}"""
+Identity File: {VM_IDENTITY if VM_IDENTITY else "Not specified (using password/agent)"}"""
 
     return info
 
@@ -541,14 +566,21 @@ def _get_project(ctx: Context[ServerSession, AppContext]) -> Project:
     return project
 
 
-def _get_project_optional(ctx: Context[ServerSession, AppContext] | None) -> Optional[Project]:
+def _get_project_optional(
+    ctx: Context[ServerSession, AppContext] | None,
+) -> Optional[Project]:
     """Get the current project if one exists, otherwise None."""
     if ctx is None:
         return None
     return ctx.request_context.lifespan_context.project  # type: ignore[union-attr]
 
 
-def _log_tool_call(ctx: Context[ServerSession, AppContext] | None, tool_name: str, params: dict, result: str | None = None) -> None:
+def _log_tool_call(
+    ctx: Context[ServerSession, AppContext] | None,
+    tool_name: str,
+    params: dict,
+    result: str | None = None,
+) -> None:
     """Log a tool call to the project log if a project is active."""
     project = _get_project_optional(ctx)
     if project is None:
@@ -571,7 +603,9 @@ def _log_tool_call(ctx: Context[ServerSession, AppContext] | None, tool_name: st
     project._log(log_msg)
 
 
-def _log_error(ctx: Context[ServerSession, AppContext] | None, tool_name: str, error: str) -> None:
+def _log_error(
+    ctx: Context[ServerSession, AppContext] | None, tool_name: str, error: str
+) -> None:
     """Log an error to the project log if a project is active."""
     project = _get_project_optional(ctx)
     if project is None:
@@ -603,9 +637,9 @@ async def project_init(
 
     info = project.get_info()
     return f"""Project initialized:
-Name: {info['name']}
-Path: {info['path']}
-Description: {info['description'] or '(none)'}
+Name: {info["name"]}
+Path: {info["path"]}
+Description: {info["description"] or "(none)"}
 
 Folders created:
 - screenshots/
@@ -627,15 +661,15 @@ async def project_info(
     info = project.get_info()
 
     return f"""Project Information:
-Name: {info['name']}
-Path: {info['path']}
-Created: {info['created_at']}
-Description: {info['description'] or '(none)'}
+Name: {info["name"]}
+Path: {info["path"]}
+Created: {info["created_at"]}
+Description: {info["description"] or "(none)"}
 
 Statistics:
-- Screenshots: {info['screenshot_count']}
-- Results: {info['result_count']}
-- Log entries: {info['log_entries']}"""
+- Screenshots: {info["screenshot_count"]}
+- Results: {info["result_count"]}
+- Log entries: {info["log_entries"]}"""
 
 
 @mcp.tool()
@@ -683,14 +717,17 @@ async def project_read_logs(
     all_lines = log_file.read_text().strip().split("\n")
 
     if level_filter:
-        all_lines = [l for l in all_lines if f"[{level_filter.upper()}]" in l]
+        all_lines = [line for line in all_lines if f"[{level_filter.upper()}]" in line]
 
     recent_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
 
     if not recent_lines:
         return f"No log entries found{' with level ' + level_filter if level_filter else ''}."
 
-    return f"Log entries ({len(recent_lines)} of {len(all_lines)} total):\n\n" + "\n".join(recent_lines)
+    return (
+        f"Log entries ({len(recent_lines)} of {len(all_lines)} total):\n\n"
+        + "\n".join(recent_lines)
+    )
 
 
 @mcp.tool()
@@ -817,11 +854,11 @@ async def project_load(
 
         info = project.get_info()
         output = f"""Project loaded:
-Name: {info['name']}
-Path: {info['path']}
-Created: {info['created_at']}
-Screenshots: {info['screenshot_count']}
-Results: {info['result_count']}"""
+Name: {info["name"]}
+Path: {info["path"]}
+Created: {info["created_at"]}
+Screenshots: {info["screenshot_count"]}
+Results: {info["result_count"]}"""
 
         # Include advice if any exists
         advice_list = project.get_all_advice()
@@ -831,8 +868,8 @@ Results: {info['result_count']}"""
             for i, advice in enumerate(advice_list, 1):
                 output += f"**{i}. {advice['title']}**\n"
                 # Show first 200 chars of content
-                content_preview = advice['content'][:200]
-                if len(advice['content']) > 200:
+                content_preview = advice["content"][:200]
+                if len(advice["content"]) > 200:
                     content_preview += "..."
                 output += f"{content_preview}\n\n"
 
