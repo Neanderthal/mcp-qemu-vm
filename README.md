@@ -326,6 +326,88 @@ For continuing work:
 3. ... continue work ...
 ```
 
+## Best Practices for LLM Automation
+
+These lessons were learned from real-world usage and help avoid common pitfalls.
+
+### 1. Always Screenshot Before Actions
+
+Before ANY interaction:
+1. `take_screenshot()`
+2. Analyze the image
+3. Identify current focus (which window/field is active)
+4. Only then proceed with actions
+
+**Never skip screenshots to "save time"** - blind actions lead to errors.
+
+### 2. Don't Trust Mouse Clicks for Focus
+
+Clicking on a window/terminal does NOT reliably switch focus, especially in:
+- Nested environments (Citrix, remote desktop)
+- High-latency connections
+- Applications with multiple panels (VS Code, IDEs)
+
+**Use keyboard shortcuts instead:**
+```json
+[
+  {"action": "press_keys", "keys": ["Ctrl", "Shift", "p"]},
+  {"action": "wait", "seconds": 0.5},
+  {"action": "type_text", "text": "Terminal: Focus Terminal"},
+  {"action": "wait", "seconds": 0.3},
+  {"action": "press_keys", "keys": ["Return"]},
+  {"action": "wait", "seconds": 0.5}
+]
+```
+Then `take_screenshot()` to verify before typing.
+
+### 3. Required Wait Times
+
+| After This Action | Wait Time |
+|-------------------|-----------|
+| Opening Command Palette | 0.5s |
+| Typing search text | 0.3s |
+| Pressing Enter/Return | 0.5-1.0s |
+| Command execution | 1.0-2.0s |
+| Window/focus switch | 0.5s |
+
+**Never rapid-fire actions** - they may arrive out of order.
+
+### 4. Use Batch Actions
+
+Use `run_actions()` instead of separate tool calls to reduce latency and ensure ordering:
+
+```python
+# Instead of 5 separate calls:
+run_actions([
+    {"action": "press_keys", "keys": ["Ctrl", "Shift", "p"]},
+    {"action": "wait", "seconds": 0.5},
+    {"action": "type_text", "text": "command"},
+    {"action": "wait", "seconds": 0.3},
+    {"action": "press_keys", "keys": ["Return"]}
+])
+```
+
+### 5. SSH Scope Limitation
+
+`ssh_execute` only reaches the **first VM layer**. For nested environments (VM → Citrix → Windows), use UI automation to type commands in the visible terminal.
+
+### 6. Recovery Commands
+
+| Problem | Solution |
+|---------|----------|
+| Typed in wrong window (few chars) | `Escape` → `u` (undo in Vim) |
+| Multiple lines in wrong place | `Escape` → `uuuuuuu` |
+| File corrupted | `Escape` → `:e!` → `Enter` (reload) |
+| VS Code revert | `Ctrl+Shift+P` → "Revert File" |
+
+### 7. Common Mistakes to Avoid
+
+1. Typing immediately after clicking terminal (focus may not have switched)
+2. Skipping screenshots to "save time"
+3. Using `ssh_execute` for nested environment commands
+4. Not waiting between actions
+5. Assuming focus switched without verification
+
 ## Architecture
 
 ```
