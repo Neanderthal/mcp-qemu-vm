@@ -6,6 +6,20 @@
 
 A Model Context Protocol (MCP) server for controlling QEMU virtual machines via SSH. This server enables LLMs to interact with VMs through mouse/keyboard control, screenshots, and SSH command execution.
 
+## Table of Contents
+
+- [Features](#features)
+- [Prerequisites](#prerequisites)
+- [QEMU/libvirt Setup](#qemulibvirt-setup)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [Tools Reference](#tools-reference)
+- [Typical Workflow](#typical-workflow)
+- [Best Practices for LLM Automation](#best-practices-for-llm-automation)
+- [Architecture](#architecture)
+- [Troubleshooting](#troubleshooting)
+
 ## Features
 
 - **Mouse Control** - Move cursor and click buttons
@@ -171,7 +185,7 @@ ssh vmrobot@192.168.122.XX 'DISPLAY=:0 scrot /tmp/test.png && echo Success'
 
 ### 1. Clone the repository
 ```bash
-git clone <repository-url>
+git clone https://github.com/Neanderthal/mcp-qemu-vm.git
 cd mcp-qemu-vm
 ```
 
