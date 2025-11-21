@@ -1,0 +1,8 @@
+[vm]
+host = "192.168.122.10"
+user = "vmrobot"
+port = 22
+# If you want key-based auth:
+identity_file = "/home/you/.ssh/id_rsa"
+display = ":0"
+
