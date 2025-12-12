@@ -220,7 +220,14 @@ async def move_mouse(
     """
     Move the mouse cursor.
 
-    mode: "absolute" or "relative"
+    Args:
+        x: X coordinate
+        y: Y coordinate
+        mode: "absolute" or "relative"
+
+    Best Practice: Prefer keyboard shortcuts over mouse operations for reliability,
+    especially in nested environments (Citrix, VMs). Mouse movements work but
+    keyboard navigation is more consistent.
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
     if mode == "absolute":
@@ -245,7 +252,14 @@ async def click(
     """
     Click a mouse button.
 
-    button: left/right/middle
+    Args:
+        button: left/right/middle
+        count: Number of clicks (1 for single, 2 for double)
+
+    ⚠️ WARNING: Mouse clicks do NOT reliably switch focus in nested environments
+    (Citrix, remote desktop, high-latency connections). Use keyboard shortcuts
+    like Ctrl+Shift+P to explicitly switch focus instead. Always verify with
+    take_screenshot() before typing after a click.
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
     button_map = {"left": 1, "middle": 2, "right": 3}
@@ -264,7 +278,18 @@ async def type_text(
     text: str,
     ctx: Context[ServerSession, AppContext] | None = None,
 ) -> str:
-    """Type literal text into the VM."""
+    """
+    Type literal text into the VM.
+
+    ⚠️ CRITICAL: ALWAYS take_screenshot() first to verify focus before typing!
+    Typing into the wrong window (e.g., Vim editor instead of terminal) will
+    corrupt files. Check for visual indicators:
+    - Cursor blinking in terminal = safe to type commands
+    - Vim mode in status bar (INSERT/NORMAL) = DO NOT type commands
+    - No cursor visible = STOP and screenshot first
+
+    The text is typed with 10ms delay between characters for reliability.
+    """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
     # naive escaping; good enough for now
     escaped = text.replace('"', r"\"")
@@ -282,7 +307,16 @@ async def press_keys(
     ctx: Context[ServerSession, AppContext] | None = None,
 ) -> str:
     """
-    Press key combo, e.g. ["Ctrl", "L"] or ["Alt", "F4"].
+    Press key combination, e.g. ["Ctrl", "L"] or ["Alt", "F4"].
+
+    Best Practice: Keyboard shortcuts are MORE RELIABLE than mouse clicks for
+    focus switching and navigation, especially in nested environments.
+    Examples:
+    - VS Code terminal focus: ["Ctrl", "Shift", "p"] then type "Terminal: Focus Terminal"
+    - Escape from Vim: ["Escape"]
+    - Common modifiers: Ctrl, Shift, Alt, Meta
+
+    Always follow with wait() and take_screenshot() to verify the action completed.
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
     # xdotool uses 'ctrl+l', 'alt+F4', etc.
@@ -299,7 +333,20 @@ async def wait(
     seconds: float,
     ctx: Context[ServerSession, AppContext] | None = None,
 ) -> str:
-    """Sleep for a bit."""
+    """
+    Sleep/pause for specified seconds.
+
+    ⚠️ REQUIRED: Always wait between actions in nested/remote environments!
+    Recommended wait times:
+    - After opening Command Palette: 0.5s
+    - After typing search text: 0.3s
+    - After pressing Enter/Return: 0.5-1.0s
+    - After command execution: 1.0-2.0s (depends on command)
+    - After window/focus switch: 0.5s
+
+    Never rapid-fire actions - they may arrive out of order or fail silently
+    due to Citrix/VM latency.
+    """
     await asyncio.sleep(seconds)
     _log_tool_call(ctx, "wait", {"seconds": seconds})
     return f"Waited {seconds} seconds"
@@ -313,6 +360,13 @@ async def run_actions(
     """
     Execute a sequence of UI actions in one call to reduce latency.
 
+    🚀 RECOMMENDED for nested/remote environments (Citrix, VMs)!
+    Benefits:
+    - Reduces round-trip latency (5 actions in 1 call vs 5 separate calls)
+    - Critical for high-latency environments
+    - Ensures sequential execution, stops on first error
+    - Actions execute reliably in order
+
     Each action is a dict with "action" key and action-specific parameters.
 
     Supported actions:
@@ -322,13 +376,14 @@ async def run_actions(
     - {"action": "move_mouse", "x": 100, "y": 200, "mode": "absolute"}
     - {"action": "wait", "seconds": 0.5}
 
-    Example sequence (open VS Code command palette and run command):
+    Example - switch to VS Code terminal reliably:
     [
         {"action": "press_keys", "keys": ["Ctrl", "Shift", "p"]},
         {"action": "wait", "seconds": 0.5},
         {"action": "type_text", "text": "Terminal: Focus Terminal"},
         {"action": "wait", "seconds": 0.3},
-        {"action": "press_keys", "keys": ["Return"]}
+        {"action": "press_keys", "keys": ["Return"]},
+        {"action": "wait", "seconds": 0.5}
     ]
 
     Returns:
@@ -405,11 +460,37 @@ async def ssh_execute(
     """
     Execute an arbitrary shell command on the VM via SSH.
 
+    ⚠️ CRITICAL LIMITATION: SSH only reaches the FIRST VM LAYER!
+
+    If you're working with nested environments (VM → Citrix → Windows → VS Code),
+    SSH commands do NOT reach those inner layers. For nested environments, use
+    UI automation tools (type_text, press_keys, run_actions) instead.
+
+    SSH is 20-40x faster than UI automation for VM tasks, so use it when possible
+    for the first VM layer (package installs, file operations, system commands).
+
+    Notes:
+    - Commands run with vmrobot user permissions
+    - Uses persistent SSH connection (no reconnect overhead)
+    - Returns stdout, stderr, and exit code
+    - Use absolute paths for reliability
+
+    Best Practices:
+    - Test commands locally before running on VM
+    - Use sudo only if passwordless sudo is configured
+    - For long-running commands, combine with wait() tool
+    - Check exit code in output to verify success
+
     Args:
-        command: The shell command to execute
+        command: The shell command to execute on the first VM
 
     Returns:
-        Command output (stdout and stderr combined)
+        Command output (stdout and stderr combined with exit code)
+
+    Examples:
+        - System info: "uname -a"
+        - Install packages: "sudo pacman -Sy package-name"
+        - Check processes: "ps aux | head -20"
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
 
@@ -454,12 +535,31 @@ async def ssh_upload(
     """
     Upload a file from the host to the VM via SFTP.
 
+    ⚠️ Note: This uploads to the first VM layer only. For nested environments,
+    files must be transferred to inner layers using alternative methods.
+
+    Notes:
+    - Uses SFTP over the persistent SSH connection
+    - Destination directory must exist (create with ssh_execute if needed)
+    - Use absolute paths for reliability
+    - Supports all file types (text, binary, archives)
+
+    Best Practices:
+    - Verify local file exists before uploading
+    - Create destination directory first: ssh_execute("mkdir -p /path/to/dir")
+    - For scripts, set permissions after upload: ssh_execute("chmod +x /path/to/script.sh")
+    - Use tar/zip for multiple files
+
     Args:
-        local_path: Path to the local file to upload
-        remote_path: Destination path on the VM
+        local_path: Path to the local file to upload (absolute or relative)
+        remote_path: Destination path on the VM (first layer, use absolute path)
 
     Returns:
         Success/failure message
+
+    Examples:
+        - Upload config: local_path="./config.json", remote_path="/home/vmrobot/config.json"
+        - Upload script: local_path="./deploy.sh", remote_path="/home/vmrobot/deploy.sh"
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
 
@@ -493,12 +593,31 @@ async def ssh_download(
     """
     Download a file from the VM to the host via SFTP.
 
+    ⚠️ Note: This downloads from the first VM layer only. For nested environments,
+    files must be transferred from inner layers using alternative methods.
+
+    Notes:
+    - Uses SFTP over the persistent SSH connection
+    - Automatically creates parent directories on host if needed
+    - Use absolute paths for reliability
+    - Supports all file types (text, binary, archives, logs)
+
+    Best Practices:
+    - Verify remote file exists first: ssh_execute("test -f /path/to/file && echo exists")
+    - Use absolute paths on both sides
+    - For logs, download before they rotate
+    - Consider compressing large files first on VM
+
     Args:
-        remote_path: Path to the file on the VM
-        local_path: Destination path on the host
+        remote_path: Path to the file on the VM (first layer, use absolute path)
+        local_path: Destination path on the host (parent dirs created automatically)
 
     Returns:
         Success/failure message
+
+    Examples:
+        - Download logs: remote_path="/var/log/app.log", local_path="./logs/app.log"
+        - Download backup: remote_path="/home/vmrobot/backup.tar.gz", local_path="./backups/backup.tar.gz"
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
 
@@ -529,8 +648,17 @@ async def ssh_connection_info(
     """
     Get information about the current SSH connection to the VM.
 
+    Use this to:
+    - Verify SSH connection is active
+    - Check connection parameters (host, port, user)
+    - Troubleshoot connection issues
+    - Confirm which VM you're connected to
+
+    The connection is persistent across all SSH tool calls, so no reconnect
+    overhead between operations.
+
     Returns:
-        Connection details including host, user, and connection status
+        Connection details including host, port, user, display, and connection status
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
 
@@ -620,8 +748,22 @@ async def project_init(
     ctx: Context[ServerSession, AppContext] | None = None,
 ) -> str:
     """
-    Initialize a new project. Must be called before other operations.
-    Creates a project folder with screenshots/, logs/, and results/ subdirectories.
+    Initialize a new project. MUST be called before screenshots and other operations.
+
+    Projects organize all outputs into a timestamped folder with:
+    - screenshots/ - All screenshots from take_screenshot()
+    - logs/ - Automatic logging of all tool calls
+    - results/ - Saved outputs via project_save_result()
+    - advice/ - Tips saved via project_save_advice()
+
+    Recommended workflow:
+    1. project_init("task-name", "description") - Start here
+    2. take_screenshot() - Now available
+    3. ... do work ... (all actions auto-logged)
+    4. project_save_advice() - Save lessons learned
+    5. project_save_result() - Save important outputs
+
+    For continuing work: project_list() → project_load("path")
 
     Args:
         name: Project name (used in folder name)
@@ -700,6 +842,14 @@ async def project_read_logs(
 ) -> str:
     """
     Read the project log file to see what happened.
+
+    All tool calls are automatically logged with:
+    - Tool name and parameters
+    - Success/failure results
+    - Errors with level=ERROR
+
+    This is useful for debugging issues or reviewing what actions were taken.
+    Use level_filter="ERROR" to see only errors.
 
     Args:
         lines: Number of recent log lines to return (default 50)
@@ -835,11 +985,17 @@ async def project_load(
     """
     Load an existing project by its path.
 
+    When loading, any saved advice is automatically displayed. READ THIS ADVICE
+    BEFORE PROCEEDING - it contains lessons learned from previous sessions that
+    will help you avoid common mistakes and work more efficiently.
+
+    Use project_list() to see all available projects.
+
     Args:
         project_path: Full path to the project folder
 
     Returns:
-        Project information
+        Project information including any saved advice
     """
     app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
 
@@ -889,8 +1045,23 @@ async def take_screenshot(
     Take a full-screen screenshot and save it to the current project.
     Requires an active project (call project_init first).
 
+    ⚠️ CRITICAL BEST PRACTICE: ALWAYS screenshot BEFORE actions!
+
+    Workflow:
+    1. take_screenshot() - see current state
+    2. Analyze the image - identify focus, window state
+    3. Perform actions - with proper waits
+    4. take_screenshot() - verify result
+
+    Never skip screenshots to "save time" - blind actions lead to errors that
+    waste more time. Screenshots help identify:
+    - Which window/application has focus
+    - Current Vim mode (if in editor)
+    - Whether dialogs are open
+    - If commands completed successfully
+
     Returns:
-        Screenshot path and resource URI
+        Screenshot path and resource URI for viewing
     """
     app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
     project = _get_project(ctx)  # type: ignore[arg-type]
