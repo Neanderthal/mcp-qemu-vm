@@ -158,7 +158,30 @@ xhost +local:vmrobot
 echo "xhost +local:" >> ~/.xprofile
 ```
 
-### 8. Find your VM's IP address
+### 8. Choose SSH user strategy
+
+There are two approaches for the SSH user:
+
+**Option A: Dedicated `vmrobot` user (default)**
+- Safer — limited permissions, can't accidentally break desktop config
+- Requires `xhost +local:vmrobot` for X11 access (step 7)
+- Set `VM_DESKTOP_USER` if you need commands that require the desktop
+  user's context (clipboard, password manager, dbus):
+  ```bash
+  # On the VM, allow vmrobot to run commands as your desktop user
+  echo 'vmrobot ALL=(sergey) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/vmrobot-desktop
+  sudo chmod 440 /etc/sudoers.d/vmrobot-desktop
+  ```
+  Then set `VM_DESKTOP_USER=sergey` in your config.
+  Use `ssh_execute("xclip -selection clipboard -o", as_desktop_user=True)`.
+
+**Option B: SSH directly as the desktop user**
+- Simpler — full desktop access out of the box, no xhost or sudo needed
+- Set `VM_USER` to your desktop username (e.g., `sergey`)
+- All commands run with full desktop permissions
+- Best for personal/development VMs where isolation isn't a concern
+
+### 9. Find your VM's IP address
 
 ```bash
 # From the host
@@ -168,7 +191,7 @@ virsh -c qemu:///system domifaddr manjaro
 ip addr show | grep "inet 192.168.122"
 ```
 
-### 9. Test the connection
+### 10. Test the connection
 
 ```bash
 # Test SSH
@@ -215,6 +238,7 @@ Set environment variables or create a `.env` file:
 | `VM_PORT` | `22` | SSH port |
 | `VM_DISPLAY` | `:0` | X11 display |
 | `VM_IDENTITY` | (empty) | SSH private key path (optional) |
+| `VM_DESKTOP_USER` | (empty) | Desktop session owner, if different from `VM_USER` |
 | `VM_KNOWN_HOSTS` | (none) | SSH known_hosts file path (optional) |
 | `VM_CONNECT_TIMEOUT` | `10` | SSH connection timeout in seconds |
 
@@ -305,7 +329,7 @@ Projects organize all outputs (screenshots, logs, results, advice) into timestam
 
 | Tool | Description |
 |------|-------------|
-| `ssh_execute(command)` | Run a shell command on the VM |
+| `ssh_execute(command, as_desktop_user)` | Run a shell command on the VM |
 | `ssh_upload(local_path, remote_path)` | Upload file to VM |
 | `ssh_download(remote_path, local_path)` | Download file from VM |
 | `ssh_connection_info()` | Get connection status |
