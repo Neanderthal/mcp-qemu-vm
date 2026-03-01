@@ -40,6 +40,12 @@ data/projects/
 .env
 .env.local
 
+# Logs (root logs from other MCP servers)
+logs/
+
+# Ruff
+.ruff_cache/
+
 # Claude Code
 .claude/
 

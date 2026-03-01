@@ -1,0 +1,19 @@
+[project]
+name = "mcp-qemu-vm"
+version = "0.1.0"
+description = "MCP server for controlling QEMU virtual machines via SSH"
+requires-python = ">=3.12"
+dependencies = [
+    "asyncssh",
+    "mcp[cli]",
+]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
