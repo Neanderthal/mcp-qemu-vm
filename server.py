@@ -19,6 +19,7 @@ VM_USER = os.getenv("VM_USER", "vmrobot")
 VM_PORT = int(os.getenv("VM_PORT", "22"))
 VM_DISPLAY = os.getenv("VM_DISPLAY", ":0")
 VM_IDENTITY = os.getenv("VM_IDENTITY", "")  # path to private key, optional
+VM_DESKTOP_USER = os.getenv("VM_DESKTOP_USER", "")  # if different from VM_USER
 
 PROJECTS_DIR = pathlib.Path("data/projects")
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -196,8 +197,20 @@ async def connect_ssh() -> asyncssh.SSHClientConnection:
     return await asyncssh.connect(**kwargs)
 
 
-async def run_vm_cmd(ssh: asyncssh.SSHClientConnection, cmd: str) -> str:
-    """Run a command inside the VM and return stdout."""
+async def run_vm_cmd(
+    ssh: asyncssh.SSHClientConnection,
+    cmd: str,
+    *,
+    as_desktop_user: bool = False,
+) -> str:
+    """Run a command inside the VM and return stdout.
+
+    If *as_desktop_user* is True and VM_DESKTOP_USER is set, the command
+    is wrapped with ``sudo -u <desktop_user>`` so it runs in the desktop
+    user's context (needed for clipboard, pass, dbus, etc.).
+    """
+    if as_desktop_user and VM_DESKTOP_USER:
+        cmd = f"sudo -u {shlex.quote(VM_DESKTOP_USER)} {cmd}"
     result = await ssh.run(cmd, check=True)
     return (result.stdout or "").strip()
 
@@ -481,6 +494,7 @@ async def run_actions(
 @mcp.tool()
 async def ssh_execute(
     command: str,
+    as_desktop_user: bool = False,
     ctx: Context[ServerSession, AppContext] | None = None,
 ) -> str:
     """
@@ -496,19 +510,18 @@ async def ssh_execute(
     for the first VM layer (package installs, file operations, system commands).
 
     Notes:
-    - Commands run with vmrobot user permissions
+    - Commands run with vmrobot user permissions by default
+    - Set as_desktop_user=True for commands needing the desktop
+      user's context (clipboard, pass, dbus, etc.)
     - Uses persistent SSH connection (no reconnect overhead)
     - Returns stdout, stderr, and exit code
     - Use absolute paths for reliability
 
-    Best Practices:
-    - Test commands locally before running on VM
-    - Use sudo only if passwordless sudo is configured
-    - For long-running commands, combine with wait() tool
-    - Check exit code in output to verify success
-
     Args:
         command: The shell command to execute on the first VM
+        as_desktop_user: Run as the desktop session owner
+            (VM_DESKTOP_USER) instead of VM_USER. Useful for
+            clipboard, password manager, and dbus operations.
 
     Returns:
         Command output (stdout and stderr combined with exit code)
@@ -516,11 +529,15 @@ async def ssh_execute(
     Examples:
         - System info: "uname -a"
         - Install packages: "sudo pacman -Sy package-name"
-        - Check processes: "ps aux | head -20"
+        - Clipboard: as_desktop_user=True, "xclip -selection clipboard -o"
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
 
     try:
+        if as_desktop_user and VM_DESKTOP_USER:
+            command = (
+                f"sudo -u {shlex.quote(VM_DESKTOP_USER)} {command}"
+            )
         result = await ssh.run(command, check=False)
         output_parts = []
 
