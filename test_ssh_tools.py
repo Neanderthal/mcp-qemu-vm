@@ -47,6 +47,7 @@ async def test_ssh_execute():
             class MockLifespan:
                 def __init__(self, ssh):
                     self.ssh = ssh
+                    self.project = None
 
             def __init__(self, ssh):
                 self.lifespan_context = self.MockLifespan(ssh)
