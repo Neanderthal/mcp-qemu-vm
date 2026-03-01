@@ -215,14 +215,10 @@ Set environment variables or create a `.env` file:
 | `VM_PORT` | `22` | SSH port |
 | `VM_DISPLAY` | `:0` | X11 display |
 | `VM_IDENTITY` | (empty) | SSH private key path (optional) |
+| `VM_KNOWN_HOSTS` | (none) | SSH known_hosts file path (optional) |
+| `VM_CONNECT_TIMEOUT` | `10` | SSH connection timeout in seconds |
 
-Example `.env` file:
-```bash
-VM_HOST=192.168.122.79
-VM_USER=vmrobot
-VM_PORT=22
-VM_DISPLAY=:0
-```
+See `.env.example` for a documented template.
 
 ## Usage
 
@@ -461,7 +457,9 @@ run_actions([
 ```
 mcp-qemu-vm/
 ├── server.py           # Main MCP server (single file)
+├── pyproject.toml      # Project metadata, ruff & pytest config
 ├── requirements.txt    # Python dependencies
+├── .env.example        # Documented env var template
 ├── data/
 │   └── projects/       # Project folders
 │       └── YYYYMMDD-HHMMSS_name/
