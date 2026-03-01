@@ -3,10 +3,11 @@ import datetime as dt
 import json
 import os
 import pathlib
+import re
+import shlex
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Optional
 
 import asyncssh
 from mcp.server.fastmcp import Context, FastMCP
@@ -21,6 +22,10 @@ VM_IDENTITY = os.getenv("VM_IDENTITY", "")  # path to private key, optional
 
 PROJECTS_DIR = pathlib.Path("data/projects")
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Every legitimate xdotool key name (Return, BackSpace, Ctrl, F12, KP_Enter, space)
+# matches this pattern. Rejects shell metacharacters like ; $ ` |
+VALID_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 # ---------- Project Management ----------
@@ -38,7 +43,7 @@ class Project:
     @classmethod
     def create(cls, name: str, description: str = "") -> "Project":
         """Create a new project with folder structure."""
-        timestamp = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S")
         project_path = PROJECTS_DIR / f"{timestamp}_{name}"
 
         # Create folder structure
@@ -87,7 +92,7 @@ class Project:
 
     def _log(self, message: str, level: str = "INFO") -> None:
         """Append a log entry to the project log file."""
-        timestamp = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M:%S")
         log_line = f"[{timestamp}] [{level}] {message}\n"
         log_file = self.path / "logs" / "project.log"
         with open(log_file, "a") as f:
@@ -115,7 +120,7 @@ class Project:
         # Create a safe filename from title
         safe_title = "".join(c if c.isalnum() or c in "- _" else "_" for c in title)
         safe_title = safe_title[:50]  # Limit length
-        timestamp = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S")
         filename = f"{timestamp}_{safe_title}.md"
 
         advice_path = self.path / "advice" / filename
@@ -170,15 +175,20 @@ class Project:
 @dataclass
 class AppContext:
     ssh: asyncssh.SSHClientConnection
-    project: Optional[Project] = None
+    project: Project | None = None
 
 
 async def connect_ssh() -> asyncssh.SSHClientConnection:
-    kwargs = dict(
+    # known_hosts defaults to None for local ephemeral QEMU VMs whose host keys
+    # change on every rebuild. Set VM_KNOWN_HOSTS to a path to enable verification.
+    kwargs: dict = dict(
         host=VM_HOST,
         port=VM_PORT,
         username=VM_USER,
-        known_hosts=None,
+        known_hosts=os.getenv("VM_KNOWN_HOSTS") or None,
+        connect_timeout=int(os.getenv("VM_CONNECT_TIMEOUT", "10")),
+        keepalive_interval=30,
+        keepalive_count_max=3,
     )
     if VM_IDENTITY:
         kwargs["client_keys"] = [VM_IDENTITY]
@@ -189,7 +199,7 @@ async def connect_ssh() -> asyncssh.SSHClientConnection:
 async def run_vm_cmd(ssh: asyncssh.SSHClientConnection, cmd: str) -> str:
     """Run a command inside the VM and return stdout."""
     result = await ssh.run(cmd, check=True)
-    return result.stdout.strip()
+    return (result.stdout or "").strip()
 
 
 # ---------- MCP server setup ----------
@@ -230,10 +240,12 @@ async def move_mouse(
     keyboard navigation is more consistent.
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    x, y = int(x), int(y)
+    display = shlex.quote(VM_DISPLAY)
     if mode == "absolute":
-        cmd = f"DISPLAY={VM_DISPLAY} xdotool mousemove --sync {x} {y}"
+        cmd = f"DISPLAY={display} xdotool mousemove --sync {x} {y}"
     elif mode == "relative":
-        cmd = f"DISPLAY={VM_DISPLAY} xdotool mousemove_relative --sync {x} {y}"
+        cmd = f"DISPLAY={display} xdotool mousemove_relative --sync {x} {y}"
     else:
         raise ValueError("mode must be 'absolute' or 'relative'")
 
@@ -266,7 +278,9 @@ async def click(
     if button not in button_map:
         raise ValueError("button must be left/middle/right")
 
-    cmd = f"DISPLAY={VM_DISPLAY} xdotool click --repeat {count} {button_map[button]}"
+    count = int(count)
+    display = shlex.quote(VM_DISPLAY)
+    cmd = f"DISPLAY={display} xdotool click --repeat {count} {button_map[button]}"
     await run_vm_cmd(ssh, cmd)
     result = f"Clicked {button} x{count}"
     _log_tool_call(ctx, "click", {"button": button, "count": count})
@@ -291,10 +305,10 @@ async def type_text(
     The text is typed with 10ms delay between characters for reliability.
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
-    # naive escaping; good enough for now
-    escaped = text.replace('"', r"\"")
-    cmd = f'DISPLAY={VM_DISPLAY} xdotool type --delay 10 "{escaped}"'
-    await run_vm_cmd(ssh, cmd)
+    # Text goes to stdin via --file -, never touches the shell
+    display = shlex.quote(VM_DISPLAY)
+    cmd = f"DISPLAY={display} xdotool type --delay 10 --clearmodifiers --file -"
+    await ssh.run(cmd, input=text, check=True)
     # Mask sensitive text in logs (only show length)
     log_text = text if len(text) <= 20 else f"{text[:10]}...({len(text)} chars)"
     _log_tool_call(ctx, "type_text", {"text": log_text})
@@ -312,16 +326,21 @@ async def press_keys(
     Best Practice: Keyboard shortcuts are MORE RELIABLE than mouse clicks for
     focus switching and navigation, especially in nested environments.
     Examples:
-    - VS Code terminal focus: ["Ctrl", "Shift", "p"] then type "Terminal: Focus Terminal"
+    - VS Code terminal focus: ["Ctrl", "Shift", "p"]
+      then type "Terminal: Focus Terminal"
     - Escape from Vim: ["Escape"]
     - Common modifiers: Ctrl, Shift, Alt, Meta
 
     Always follow with wait() and take_screenshot() to verify the action completed.
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    for k in keys:
+        if not VALID_KEY_PATTERN.match(k):
+            raise ValueError(f"Invalid key name: {k!r}")
     # xdotool uses 'ctrl+l', 'alt+F4', etc.
     combo = "+".join(k.lower() for k in keys)
-    cmd = f"DISPLAY={VM_DISPLAY} xdotool key {combo}"
+    display = shlex.quote(VM_DISPLAY)
+    cmd = f"DISPLAY={display} xdotool key {shlex.quote(combo)}"
     await run_vm_cmd(ssh, cmd)
     result = f"Pressed keys: {keys}"
     _log_tool_call(ctx, "press_keys", {"keys": keys})
@@ -396,37 +415,44 @@ async def run_actions(
         action_type = action_def.get("action")
 
         try:
+            display = shlex.quote(VM_DISPLAY)
+
             if action_type == "press_keys":
                 keys = action_def.get("keys", [])
+                for k in keys:
+                    if not VALID_KEY_PATTERN.match(k):
+                        raise ValueError(f"Invalid key name: {k!r}")
                 combo = "+".join(k.lower() for k in keys)
-                cmd = f"DISPLAY={VM_DISPLAY} xdotool key {combo}"
+                cmd = f"DISPLAY={display} xdotool key {shlex.quote(combo)}"
                 await run_vm_cmd(ssh, cmd)
                 results.append(f"{i + 1}. press_keys {keys}")
 
             elif action_type == "type_text":
                 text = action_def.get("text", "")
-                escaped = text.replace('"', r"\"")
-                cmd = f'DISPLAY={VM_DISPLAY} xdotool type --delay 10 "{escaped}"'
-                await run_vm_cmd(ssh, cmd)
+                cmd = (
+                    f"DISPLAY={display} xdotool type"
+                    " --delay 10 --clearmodifiers --file -"
+                )
+                await ssh.run(cmd, input=text, check=True)
                 results.append(f"{i + 1}. type_text ({len(text)} chars)")
 
             elif action_type == "click":
                 button = action_def.get("button", "left")
-                count = action_def.get("count", 1)
+                count = int(action_def.get("count", 1))
                 button_map = {"left": 1, "middle": 2, "right": 3}
                 btn_num = button_map.get(button, 1)
-                cmd = f"DISPLAY={VM_DISPLAY} xdotool click --repeat {count} {btn_num}"
+                cmd = f"DISPLAY={display} xdotool click --repeat {count} {btn_num}"
                 await run_vm_cmd(ssh, cmd)
                 results.append(f"{i + 1}. click {button} x{count}")
 
             elif action_type == "move_mouse":
-                x = action_def.get("x", 0)
-                y = action_def.get("y", 0)
+                x = int(action_def.get("x", 0))
+                y = int(action_def.get("y", 0))
                 mode = action_def.get("mode", "absolute")
                 if mode == "absolute":
-                    cmd = f"DISPLAY={VM_DISPLAY} xdotool mousemove --sync {x} {y}"
+                    cmd = f"DISPLAY={display} xdotool mousemove --sync {x} {y}"
                 else:
-                    cmd = f"DISPLAY={VM_DISPLAY} xdotool mousemove_relative --sync {x} {y}"
+                    cmd = f"DISPLAY={display} xdotool mousemove_relative --sync {x} {y}"
                 await run_vm_cmd(ssh, cmd)
                 results.append(f"{i + 1}. move_mouse ({x}, {y}) [{mode}]")
 
@@ -547,7 +573,8 @@ async def ssh_upload(
     Best Practices:
     - Verify local file exists before uploading
     - Create destination directory first: ssh_execute("mkdir -p /path/to/dir")
-    - For scripts, set permissions after upload: ssh_execute("chmod +x /path/to/script.sh")
+    - For scripts, set permissions after upload:
+      ssh_execute("chmod +x /path/to/script.sh")
     - Use tar/zip for multiple files
 
     Args:
@@ -558,7 +585,8 @@ async def ssh_upload(
         Success/failure message
 
     Examples:
-        - Upload config: local_path="./config.json", remote_path="/home/vmrobot/config.json"
+        - Upload config: local_path="./config.json",
+          remote_path="/home/vmrobot/config.json"
         - Upload script: local_path="./deploy.sh", remote_path="/home/vmrobot/deploy.sh"
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
@@ -603,7 +631,8 @@ async def ssh_download(
     - Supports all file types (text, binary, archives, logs)
 
     Best Practices:
-    - Verify remote file exists first: ssh_execute("test -f /path/to/file && echo exists")
+    - Verify remote file exists first:
+      ssh_execute("test -f /path/to/file && echo exists")
     - Use absolute paths on both sides
     - For logs, download before they rotate
     - Consider compressing large files first on VM
@@ -617,7 +646,9 @@ async def ssh_download(
 
     Examples:
         - Download logs: remote_path="/var/log/app.log", local_path="./logs/app.log"
-        - Download backup: remote_path="/home/vmrobot/backup.tar.gz", local_path="./backups/backup.tar.gz"
+        - Download backup:
+          remote_path="/home/vmrobot/backup.tar.gz",
+          local_path="./backups/backup.tar.gz"
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
 
@@ -678,7 +709,7 @@ Port: {VM_PORT}
 User: {VM_USER}
 Display: {VM_DISPLAY}
 Status: {status}
-Identity File: {VM_IDENTITY if VM_IDENTITY else "Not specified (using password/agent)"}"""
+Identity File: {VM_IDENTITY or "Not specified (using password/agent)"}"""
 
     return info
 
@@ -696,7 +727,7 @@ def _get_project(ctx: Context[ServerSession, AppContext]) -> Project:
 
 def _get_project_optional(
     ctx: Context[ServerSession, AppContext] | None,
-) -> Optional[Project]:
+) -> Project | None:
     """Get the current project if one exists, otherwise None."""
     if ctx is None:
         return None
@@ -872,7 +903,8 @@ async def project_read_logs(
     recent_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
 
     if not recent_lines:
-        return f"No log entries found{' with level ' + level_filter if level_filter else ''}."
+        suffix = f" with level {level_filter}" if level_filter else ""
+        return f"No log entries found{suffix}."
 
     return (
         f"Log entries ({len(recent_lines)} of {len(all_lines)} total):\n\n"
@@ -1067,9 +1099,10 @@ async def take_screenshot(
     project = _get_project(ctx)  # type: ignore[arg-type]
     ssh = app_ctx.ssh
 
-    sid = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S-%f")
+    sid = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S-%f")
     remote_path = f"/tmp/mcp-screenshot-{sid}.png"
-    cmd = f'DISPLAY={VM_DISPLAY} scrot "{remote_path}"'
+    display = shlex.quote(VM_DISPLAY)
+    cmd = f"DISPLAY={display} scrot {shlex.quote(remote_path)}"
     await run_vm_cmd(ssh, cmd)
 
     # download via SFTP to project folder
