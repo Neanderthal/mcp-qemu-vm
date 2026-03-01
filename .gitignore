@@ -48,6 +48,7 @@ logs/
 
 # Claude Code
 .claude/
+!.claude/rules/
 
 # OS
 .DS_Store
