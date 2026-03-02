@@ -268,6 +268,178 @@ async def move_mouse(
     return result
 
 
+def _parse_frame_extents(xprop_output: str) -> tuple[int, int, int, int]:
+    """Parse _NET_FRAME_EXTENTS from xprop output.
+
+    Returns (left, right, top, bottom). Defaults to (0, 0, 0, 0) if
+    the property is missing (e.g. undecorated windows).
+    """
+    for line in xprop_output.splitlines():
+        if "_NET_FRAME_EXTENTS" in line and "=" in line:
+            _, _, values = line.partition("=")
+            parts = [int(v.strip()) for v in values.split(",")]
+            if len(parts) == 4:
+                return (parts[0], parts[1], parts[2], parts[3])
+    return (0, 0, 0, 0)
+
+
+async def _get_active_window_geometry(
+    ssh: asyncssh.SSHClientConnection,
+) -> dict:
+    """Get geometry, name, and frame extents of the active window.
+
+    Returns a dict with keys: window_id, name, x, y, width, height,
+    frame_left, frame_right, frame_top, frame_bottom, client_x, client_y.
+    """
+    display = shlex.quote(VM_DISPLAY)
+    cmd = (
+        f"WID=$(DISPLAY={display} xdotool getactivewindow) && "
+        f"DISPLAY={display} xdotool getwindowgeometry --shell $WID && "
+        f'echo "---NAME---" && '
+        f"DISPLAY={display} xdotool getwindowname $WID && "
+        f'echo "---FRAME---" && '
+        f"xprop -display {display} -id $WID _NET_FRAME_EXTENTS 2>/dev/null || true"
+    )
+    output = await run_vm_cmd(ssh, cmd)
+
+    # Parse getwindowgeometry --shell output (WINDOW=..., X=..., Y=..., etc.)
+    geo: dict = {}
+    name_section = False
+    frame_section = False
+    name_lines: list[str] = []
+    frame_lines: list[str] = []
+
+    for line in output.splitlines():
+        if line.strip() == "---NAME---":
+            name_section = True
+            frame_section = False
+            continue
+        if line.strip() == "---FRAME---":
+            name_section = False
+            frame_section = True
+            continue
+        if frame_section:
+            frame_lines.append(line)
+        elif name_section:
+            name_lines.append(line)
+        elif "=" in line:
+            key, _, val = line.partition("=")
+            geo[key.strip()] = val.strip()
+
+    window_id = int(geo.get("WINDOW", "0"))
+    x = int(geo.get("X", "0"))
+    y = int(geo.get("Y", "0"))
+    width = int(geo.get("WIDTH", "0"))
+    height = int(geo.get("HEIGHT", "0"))
+    name = "\n".join(name_lines).strip()
+
+    fl, fr, ft, fb = _parse_frame_extents("\n".join(frame_lines))
+
+    return {
+        "window_id": window_id,
+        "name": name,
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "frame_left": fl,
+        "frame_right": fr,
+        "frame_top": ft,
+        "frame_bottom": fb,
+        "client_x": x + fl,
+        "client_y": y + ft,
+    }
+
+
+@mcp.tool()
+async def get_active_window_info(
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Get geometry and frame information about the currently focused window.
+
+    Returns structured data about the active window including its position,
+    size, decoration (frame) extents, and the computed client-area origin.
+    Use this to understand where the window content starts on screen.
+
+    Returned fields:
+    - window_id, name: X11 window ID and title
+    - x, y: top-left of the window frame on screen
+    - width, height: window client-area dimensions
+    - frame_left/right/top/bottom: decoration extents (CSD/SSD title bar, borders)
+    - client_x, client_y: top-left of the content area in screen coords
+      (computed as x + frame_left, y + frame_top)
+    """
+    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    info = await _get_active_window_geometry(ssh)
+    _log_tool_call(ctx, "get_active_window_info", {}, info["name"])
+
+    lines = [
+        f"Window ID: {info['window_id']}",
+        f"Name: {info['name']}",
+        f"Position: ({info['x']}, {info['y']})",
+        f"Size: {info['width']}x{info['height']}",
+        f"Frame extents: left={info['frame_left']}, right={info['frame_right']}, "
+        f"top={info['frame_top']}, bottom={info['frame_bottom']}",
+        f"Client area origin: ({info['client_x']}, {info['client_y']})",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def click_in_window(
+    x: int,
+    y: int,
+    button: str = "left",
+    count: int = 1,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Click at coordinates relative to the active window's client area.
+
+    The server internally resolves the active window's position and frame
+    (title bar / CSD) extents, then translates the given (x, y) to absolute
+    screen coordinates before clicking. This eliminates all CSD/frame offset
+    math from the caller — just pass the offset within the window content
+    (e.g. from CSS coordinates or screenshot pixel measurements).
+
+    Args:
+        x: X offset within the window content area (0 = left edge)
+        y: Y offset within the window content area (0 = top edge, below title bar)
+        button: left/right/middle
+        count: Number of clicks (1 for single, 2 for double)
+    """
+    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    button_map = {"left": 1, "middle": 2, "right": 3}
+    if button not in button_map:
+        raise ValueError("button must be left/middle/right")
+
+    x, y, count = int(x), int(y), int(count)
+
+    info = await _get_active_window_geometry(ssh)
+    screen_x = info["client_x"] + x
+    screen_y = info["client_y"] + y
+
+    display = shlex.quote(VM_DISPLAY)
+    cmd = (
+        f"DISPLAY={display} xdotool mousemove --sync {screen_x} {screen_y} && "
+        f"DISPLAY={display} xdotool click --repeat {count} {button_map[button]}"
+    )
+    await run_vm_cmd(ssh, cmd)
+
+    result = (
+        f"Clicked {button} x{count} at window-relative ({x}, {y}) "
+        f"→ screen ({screen_x}, {screen_y})"
+    )
+    _log_tool_call(
+        ctx,
+        "click_in_window",
+        {"x": x, "y": y, "button": button, "count": count},
+        result,
+    )
+    return result
+
+
 @mcp.tool()
 async def click(
     button: str = "left",

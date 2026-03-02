@@ -11,7 +11,7 @@
 
 - **Project Management**: `project_init`, `project_info`, `project_list`, `project_load`, `project_log`, `project_read_logs`, `project_save_result`
 - **Advice System**: `project_save_advice`, `project_read_advice` — tips persisted per-project for future sessions
-- **UI Automation**: `move_mouse`, `click`, `type_text`, `press_keys`, `wait`, `run_actions` — via xdotool over SSH
+- **UI Automation**: `move_mouse`, `get_active_window_info`, `click_in_window`, `click`, `type_text`, `press_keys`, `wait`, `run_actions` — via xdotool over SSH
 - **SSH Operations**: `ssh_execute`, `ssh_upload`, `ssh_download`, `ssh_connection_info`
 - **Screenshots**: `take_screenshot` — via scrot, saved to project folder, exposed as MCP resource `vm://screenshot/{id}`
 
