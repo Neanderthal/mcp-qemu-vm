@@ -7,7 +7,10 @@ import asyncio
 import os
 from typing import Any
 
-from server import connect_ssh, ssh_execute
+from server import DisplayCalibration, connect_ssh, ssh_execute
+
+# 1:1 calibration for tests (no scaling)
+IDENTITY_CALIBRATION = DisplayCalibration(0, 0, 0, 0, 1.0, 1.0)
 
 
 class MockAppContext:
@@ -15,6 +18,7 @@ class MockAppContext:
 
     def __init__(self, ssh: Any):
         self.ssh = ssh
+        self.calibration = IDENTITY_CALIBRATION
 
 
 async def test_connection():
@@ -47,6 +51,7 @@ async def test_ssh_execute():
             class MockLifespan:
                 def __init__(self, ssh):
                     self.ssh = ssh
+                    self.calibration = IDENTITY_CALIBRATION
                     self.project = None
 
             def __init__(self, ssh):

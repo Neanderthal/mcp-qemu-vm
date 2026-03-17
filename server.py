@@ -5,6 +5,7 @@ import os
 import pathlib
 import re
 import shlex
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -174,8 +175,21 @@ class Project:
 
 
 @dataclass
+class DisplayCalibration:
+    """Scale factors between xdotool coordinate space and screenshot pixels."""
+
+    xdotool_w: int
+    xdotool_h: int
+    screenshot_w: int
+    screenshot_h: int
+    scale_x: float  # xdotool_w / screenshot_w
+    scale_y: float  # xdotool_h / screenshot_h
+
+
+@dataclass
 class AppContext:
     ssh: asyncssh.SSHClientConnection
+    calibration: DisplayCalibration
     project: Project | None = None
 
 
@@ -215,14 +229,84 @@ async def run_vm_cmd(
     return (result.stdout or "").strip()
 
 
+async def _calibrate_display(
+    ssh: asyncssh.SSHClientConnection,
+) -> DisplayCalibration:
+    """Probe the VM display to compute scale factors.
+
+    Compares xdotool's coordinate space with the actual screenshot pixel
+    dimensions.  Falls back to 1:1 scale on any failure (non-fatal).
+    """
+    fallback = DisplayCalibration(0, 0, 0, 0, 1.0, 1.0)
+    display = shlex.quote(VM_DISPLAY)
+    try:
+        # 1) xdotool coordinate space
+        geo = await run_vm_cmd(ssh, f"DISPLAY={display} xdotool getdisplaygeometry")
+        xw, xh = (int(v) for v in geo.split())
+
+        # 2) Take a calibration screenshot and read its pixel dimensions
+        cal_path = "/tmp/mcp-calibrate.png"
+        await run_vm_cmd(
+            ssh,
+            f"DISPLAY={display} scrot {shlex.quote(cal_path)}",
+        )
+        file_info = await run_vm_cmd(ssh, f"file {shlex.quote(cal_path)}")
+        await run_vm_cmd(ssh, f"rm -f {shlex.quote(cal_path)}")
+
+        # Parse "PNG image data, 1920 x 1080, ..." from `file` output
+        m = re.search(r"(\d+)\s*x\s*(\d+)", file_info)
+        if not m:
+            print(
+                "[calibration] Could not parse screenshot "
+                f"dimensions from: {file_info}",
+                file=sys.stderr,
+            )
+            return fallback
+        sw, sh = int(m.group(1)), int(m.group(2))
+
+        scale_x = xw / sw
+        scale_y = xh / sh
+        cal = DisplayCalibration(xw, xh, sw, sh, scale_x, scale_y)
+
+        if scale_x == 1.0 and scale_y == 1.0:
+            print("[calibration] 1:1, no scaling needed", file=sys.stderr)
+        else:
+            print(
+                f"[calibration] xdotool={xw}x{xh}, screenshot={sw}x{sh}, "
+                f"scale=({scale_x:.4f}, {scale_y:.4f})",
+                file=sys.stderr,
+            )
+        return cal
+
+    except Exception as exc:
+        print(
+            f"[calibration] Failed ({exc}), falling back to 1:1 scale",
+            file=sys.stderr,
+        )
+        return fallback
+
+
+def _scale_input(cal: DisplayCalibration, x: int, y: int) -> tuple[int, int]:
+    """Convert screenshot-space coordinates to xdotool-space (multiply)."""
+    return round(x * cal.scale_x), round(y * cal.scale_y)
+
+
+def _scale_output(cal: DisplayCalibration, x: int, y: int) -> tuple[int, int]:
+    """Convert xdotool-space coordinates to screenshot-space (divide)."""
+    if cal.scale_x == 0 or cal.scale_y == 0:
+        return x, y
+    return round(x / cal.scale_x), round(y / cal.scale_y)
+
+
 # ---------- MCP server setup ----------
 
 
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     ssh = await connect_ssh()
+    calibration = await _calibrate_display(ssh)
     try:
-        yield AppContext(ssh=ssh)
+        yield AppContext(ssh=ssh, calibration=calibration)
     finally:
         ssh.close()
         await ssh.wait_closed()
@@ -252,13 +336,16 @@ async def move_mouse(
     especially in nested environments (Citrix, VMs). Mouse movements work but
     keyboard navigation is more consistent.
     """
-    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    ssh = app_ctx.ssh
+    cal = app_ctx.calibration
     x, y = int(x), int(y)
+    sx, sy = _scale_input(cal, x, y)
     display = shlex.quote(VM_DISPLAY)
     if mode == "absolute":
-        cmd = f"DISPLAY={display} xdotool mousemove --sync {x} {y}"
+        cmd = f"DISPLAY={display} xdotool mousemove --sync {sx} {sy}"
     elif mode == "relative":
-        cmd = f"DISPLAY={display} xdotool mousemove_relative --sync {x} {y}"
+        cmd = f"DISPLAY={display} xdotool mousemove_relative --sync {sx} {sy}"
     else:
         raise ValueError("mode must be 'absolute' or 'relative'")
 
@@ -370,18 +457,27 @@ async def get_active_window_info(
     - client_x, client_y: top-left of the content area in screen coords
       (computed as x + frame_left, y + frame_top)
     """
-    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    ssh = app_ctx.ssh
+    cal = app_ctx.calibration
     info = await _get_active_window_geometry(ssh)
     _log_tool_call(ctx, "get_active_window_info", {}, info["name"])
+
+    # Convert xdotool-space coordinates to screenshot-space for the caller
+    pos_x, pos_y = _scale_output(cal, info["x"], info["y"])
+    w, h = _scale_output(cal, info["width"], info["height"])
+    fl, fr = _scale_output(cal, info["frame_left"], info["frame_right"])
+    ft, fb = _scale_output(cal, info["frame_top"], info["frame_bottom"])
+    cx, cy = _scale_output(cal, info["client_x"], info["client_y"])
 
     lines = [
         f"Window ID: {info['window_id']}",
         f"Name: {info['name']}",
-        f"Position: ({info['x']}, {info['y']})",
-        f"Size: {info['width']}x{info['height']}",
-        f"Frame extents: left={info['frame_left']}, right={info['frame_right']}, "
-        f"top={info['frame_top']}, bottom={info['frame_bottom']}",
-        f"Client area origin: ({info['client_x']}, {info['client_y']})",
+        f"Position: ({pos_x}, {pos_y})",
+        f"Size: {w}x{h}",
+        f"Frame extents: left={fl}, right={fr}, "
+        f"top={ft}, bottom={fb}",
+        f"Client area origin: ({cx}, {cy})",
     ]
     return "\n".join(lines)
 
@@ -409,16 +505,19 @@ async def click_in_window(
         button: left/right/middle
         count: Number of clicks (1 for single, 2 for double)
     """
-    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    ssh = app_ctx.ssh
+    cal = app_ctx.calibration
     button_map = {"left": 1, "middle": 2, "right": 3}
     if button not in button_map:
         raise ValueError("button must be left/middle/right")
 
     x, y, count = int(x), int(y), int(count)
+    sx, sy = _scale_input(cal, x, y)
 
     info = await _get_active_window_geometry(ssh)
-    screen_x = info["client_x"] + x
-    screen_y = info["client_y"] + y
+    screen_x = info["client_x"] + sx
+    screen_y = info["client_y"] + sy
 
     display = shlex.quote(VM_DISPLAY)
     cmd = (
@@ -593,7 +692,9 @@ async def run_actions(
     Returns:
         Summary of executed actions
     """
-    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    ssh = app_ctx.ssh
+    cal = app_ctx.calibration
     results = []
 
     for i, action_def in enumerate(actions):
@@ -634,10 +735,14 @@ async def run_actions(
                 x = int(action_def.get("x", 0))
                 y = int(action_def.get("y", 0))
                 mode = action_def.get("mode", "absolute")
+                sx, sy = _scale_input(cal, x, y)
                 if mode == "absolute":
-                    cmd = f"DISPLAY={display} xdotool mousemove --sync {x} {y}"
+                    cmd = f"DISPLAY={display} xdotool mousemove --sync {sx} {sy}"
                 else:
-                    cmd = f"DISPLAY={display} xdotool mousemove_relative --sync {x} {y}"
+                    cmd = (
+                        f"DISPLAY={display} xdotool"
+                        f" mousemove_relative --sync {sx} {sy}"
+                    )
                 await run_vm_cmd(ssh, cmd)
                 results.append(f"{i + 1}. move_mouse ({x}, {y}) [{mode}]")
 
@@ -892,15 +997,61 @@ async def ssh_connection_info(
 
     _log_tool_call(ctx, "ssh_connection_info", {}, status)
 
+    cal = ctx.request_context.lifespan_context.calibration  # type: ignore[union-attr]
+    cal_line = (
+        f"Display Calibration: xdotool={cal.xdotool_w}x{cal.xdotool_h}, "
+        f"screenshot={cal.screenshot_w}x{cal.screenshot_h}, "
+        f"scale=({cal.scale_x:.4f}, {cal.scale_y:.4f})"
+    )
+
     info = f"""SSH Connection Information:
 Host: {VM_HOST}
 Port: {VM_PORT}
 User: {VM_USER}
 Display: {VM_DISPLAY}
 Status: {status}
-Identity File: {VM_IDENTITY or "Not specified (using password/agent)"}"""
+Identity File: {VM_IDENTITY or "Not specified (using password/agent)"}
+{cal_line}"""
 
     return info
+
+
+@mcp.tool()
+async def display_calibration_info(
+    recalibrate: bool = False,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Show current display calibration data (scale factors between xdotool
+    and screenshot coordinate spaces).
+
+    Set recalibrate=True to re-probe the display (useful after xrandr
+    resolution changes mid-session).
+
+    Returns:
+        Calibration details including xdotool geometry, screenshot
+        dimensions, and computed scale factors.
+    """
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+
+    if recalibrate:
+        app_ctx.calibration = await _calibrate_display(app_ctx.ssh)
+
+    cal = app_ctx.calibration
+    _log_tool_call(ctx, "display_calibration_info", {"recalibrate": recalibrate})
+
+    no_scale = cal.scale_x == 1.0 and cal.scale_y == 1.0
+    scaling = "1:1 (no scaling)" if no_scale else "active"
+    lines = [
+        f"Display Calibration ({scaling}):",
+        f"  xdotool geometry: {cal.xdotool_w}x{cal.xdotool_h}",
+        f"  Screenshot pixels: {cal.screenshot_w}x{cal.screenshot_h}",
+        f"  Scale X: {cal.scale_x:.4f}",
+        f"  Scale Y: {cal.scale_y:.4f}",
+    ]
+    if recalibrate:
+        lines.append("  (recalibrated)")
+    return "\n".join(lines)
 
 
 # ---------- Project Tools ----------
