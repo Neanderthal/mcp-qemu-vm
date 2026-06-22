@@ -23,9 +23,11 @@ from server import (
     _act_key_down,
     _act_key_up,
     _act_move_mouse,
+    _act_paste,
     _act_press_keys,
     _act_screenshot,
     _act_scroll,
+    _act_set_clipboard,
     _act_type_text,
     _act_wait,
     _click_at_cmd,
@@ -38,6 +40,7 @@ from server import (
     _run_type,
     _activate_window,
     _capture_screenshot,
+    _clipboard_set_cmd,
     _scale_input,
     _scale_output,
     _scroll_cmd,
@@ -267,6 +270,8 @@ def test_action_handlers_registry_is_canonical_set():
         "key_up",
         "activate_window",
         "screenshot",
+        "set_clipboard",
+        "paste",
         "wait",
     }
 
@@ -405,6 +410,44 @@ def test_capture_screenshot_requires_project():
 def test_act_screenshot_requires_project():
     with pytest.raises(ValueError, match="No project initialized"):
         asyncio.run(_act_screenshot(FakeApp(FakeSSH(), project=None), DISPLAY_Q, {}))
+
+
+# ---------- clipboard / paste ----------
+
+
+def test_clipboard_set_cmd_uses_xclip_and_discards_output():
+    cmd = _clipboard_set_cmd(DISPLAY_Q)
+    assert "xclip -selection clipboard -in" in cmd
+    assert ">/dev/null 2>&1" in cmd
+
+
+def test_act_set_clipboard_pipes_text_via_stdin():
+    ssh = FakeSSH()
+    summary = asyncio.run(
+        _act_set_clipboard(FakeApp(ssh), DISPLAY_Q, {"text": "hello clip"})
+    )
+    assert summary == "set_clipboard (10 chars)"
+    # text must be passed as stdin input, never inline in the command
+    assert ("hello clip" in (inp or "") for _, inp in ssh.calls)
+    assert all("hello clip" not in cmd for cmd, _ in ssh.calls)
+
+
+def test_act_paste_with_text_sets_then_ctrl_v():
+    ssh = FakeSSH()
+    summary = asyncio.run(_act_paste(FakeApp(ssh), DISPLAY_Q, {"text": "payload"}))
+    assert summary == "paste (7 chars)"
+    cmds = _cmds(ssh)
+    assert any("xclip -selection clipboard -in" in c for c in cmds)
+    assert any("xdotool key ctrl+v" in c for c in cmds)
+
+
+def test_act_paste_without_text_only_ctrl_v():
+    ssh = FakeSSH()
+    summary = asyncio.run(_act_paste(FakeApp(ssh), DISPLAY_Q, {}))
+    assert summary == "paste"
+    cmds = _cmds(ssh)
+    assert all("xclip" not in c for c in cmds)
+    assert any("xdotool key ctrl+v" in c for c in cmds)
 
 
 def test_act_wait_summary():

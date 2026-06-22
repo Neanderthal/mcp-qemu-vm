@@ -76,6 +76,15 @@ def _keys_cmd(display_q: str, keys: list[str]) -> str:
     return _key_event_cmd(display_q, keys, "key")
 
 
+def _clipboard_set_cmd(display_q: str) -> str:
+    """Build the command that loads the X clipboard from stdin via xclip.
+
+    Text is piped in (never on the command line). xclip's stdout/stderr are
+    discarded so the forked selection owner doesn't hold the SSH channel open.
+    """
+    return f"DISPLAY={display_q} xclip -selection clipboard -in >/dev/null 2>&1"
+
+
 def _click_cmd(display_q: str, button: str, count: int) -> str:
     """Build an `xdotool click` command. Count is clamped to >= 1 (xdotool
     rejects --repeat 0)."""
@@ -800,6 +809,55 @@ async def type_text(
 
 
 @mcp.tool()
+async def set_clipboard(
+    text: str,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Load the VM clipboard with text (first VM layer's X clipboard).
+
+    Faster and more reliable than type_text() for large ASCII blobs. Follow
+    with paste() or press_keys(["Ctrl", "v"]) to insert it.
+
+    ⚠️ Clipboard redirection is often disabled across nested boundaries
+    (Citrix/RDP) — paste may not cross into inner sessions. See README
+    Known Issues #3.
+    """
+    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    display = shlex.quote(VM_DISPLAY)
+    # Text goes to xclip via stdin, never the shell
+    await ssh.run(_clipboard_set_cmd(display), input=text, check=True)
+    _log_tool_call(ctx, "set_clipboard", {"chars": len(text)})
+    return f"Clipboard set ({len(text)} chars)"
+
+
+@mcp.tool()
+async def paste(
+    text: str | None = None,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Paste with Ctrl+V, optionally setting the clipboard first.
+
+    If *text* is given, the clipboard is loaded with it and then pasted in one
+    call — a fast alternative to type_text() for big ASCII payloads. If omitted,
+    pastes whatever is already on the clipboard.
+
+    Note: terminals usually need Ctrl+Shift+V — use press_keys(["Ctrl",
+    "Shift", "v"]) there instead. Clipboard may not cross nested boundaries
+    (see README Known Issues #3).
+    """
+    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    display = shlex.quote(VM_DISPLAY)
+    if text is not None:
+        await ssh.run(_clipboard_set_cmd(display), input=text, check=True)
+    await run_vm_cmd(ssh, _keys_cmd(display, ["ctrl", "v"]))
+    set_note = f" ({len(text)} chars set)" if text is not None else ""
+    _log_tool_call(ctx, "paste", {"chars": len(text) if text is not None else 0})
+    return f"Pasted{set_note}"
+
+
+@mcp.tool()
 async def press_keys(
     keys: list[str],
     ctx: Context[ServerSession, AppContext] | None = None,
@@ -1035,6 +1093,20 @@ async def _act_screenshot(app: "AppContext", display: str, a: dict) -> str:
     return f"screenshot -> vm://screenshot/{sid}"
 
 
+async def _act_set_clipboard(app: "AppContext", display: str, a: dict) -> str:
+    text = a.get("text", "")
+    await app.ssh.run(_clipboard_set_cmd(display), input=text, check=True)
+    return f"set_clipboard ({len(text)} chars)"
+
+
+async def _act_paste(app: "AppContext", display: str, a: dict) -> str:
+    text = a.get("text")
+    if text is not None:
+        await app.ssh.run(_clipboard_set_cmd(display), input=text, check=True)
+    await run_vm_cmd(app.ssh, _keys_cmd(display, ["ctrl", "v"]))
+    return "paste" + (f" ({len(text)} chars)" if text is not None else "")
+
+
 async def _act_wait(app: "AppContext", display: str, a: dict) -> str:
     seconds = a.get("seconds", 0.5)
     await asyncio.sleep(seconds)
@@ -1052,6 +1124,8 @@ ACTION_HANDLERS = {
     "key_up": _act_key_up,
     "activate_window": _act_activate_window,
     "screenshot": _act_screenshot,
+    "set_clipboard": _act_set_clipboard,
+    "paste": _act_paste,
     "wait": _act_wait,
 }
 
