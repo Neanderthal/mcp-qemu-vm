@@ -501,6 +501,11 @@ mcp-qemu-vm/
 Issues confirmed in real nested-environment use (host → Citrix → Windows → Outlook).
 Each lists the symptom, the root cause, and the current workaround.
 
+**#1 and #2 are fixed in `server.py`.** #3–#6 are inherent limitations of the nested
+environment (Citrix/RDP session policy) or the architecture (SSH lands on the first VM
+layer only) — they can't be fixed in this server, so the workarounds remain the
+recommended approach.
+
 ### 1. `type_text` fails on Cyrillic / non-ASCII text — FIXED
 
 - **Symptom:** `type_text` (and any `xdotool type` with non-ASCII) errors out with
@@ -516,7 +521,7 @@ Each lists the symptom, the root cause, and the current workaround.
   `C.UTF-8` (e.g. set `VM_LOCALE=ru_RU.utf8`; check available locales with
   `locale -a`).
 
-### 2. Embedded newlines in typed text become literal glyphs, not Enter
+### 2. Embedded newlines in typed text become literal glyphs, not Enter — FIXED
 
 - **Symptom:** Typing multi-line text (e.g. `xdotool type` with `\n`, or
   `type --file -`) into a rich editor like Outlook produces one **run-on paragraph**
@@ -525,13 +530,10 @@ Each lists the symptom, the root cause, and the current workaround.
 - **Root cause:** In this nested Citrix → Windows path, the `\n` (LF) is delivered as a
   literal control character to the editor instead of being interpreted as a Return
   keypress.
-- **Workaround:** never embed `\n` in typed text for rich editors. Type each paragraph
-  separately and send line breaks as explicit key events:
-  ```bash
-  xdotool type --clearmodifiers "Первый абзац."
-  xdotool key Return Return
-  xdotool type --clearmodifiers "Второй абзац."
-  ```
+- **Fix (applied):** `type_text` (and the `run_actions` type step) now split text on
+  newlines, type each line via stdin, and send line breaks as explicit `Return` key
+  presses instead of a literal LF. `\r\n` and `\r` are normalised first. This works in
+  both terminals and rich editors — no caller-side splitting needed.
 
 ### 3. Clipboard redirection may be disabled in the guest session
 
