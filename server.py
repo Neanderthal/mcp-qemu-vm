@@ -725,6 +725,56 @@ async def wait(
     return f"Waited {seconds} seconds"
 
 
+# ---------- Batch action handlers ----------
+# Each handler runs one batch action and returns a short human summary. The
+# ACTION_HANDLERS dict below is the single source of truth for which actions
+# run_actions() supports — add an action by writing a handler and one entry.
+# Signature: async (app_ctx, display_q, action_dict) -> str
+
+
+async def _act_press_keys(app: "AppContext", display: str, a: dict) -> str:
+    keys = a.get("keys", [])
+    await run_vm_cmd(app.ssh, _keys_cmd(display, keys))
+    return f"press_keys {keys}"
+
+
+async def _act_type_text(app: "AppContext", display: str, a: dict) -> str:
+    text = a.get("text", "")
+    await _run_type(app.ssh, display, text)
+    return f"type_text ({len(text)} chars)"
+
+
+async def _act_click(app: "AppContext", display: str, a: dict) -> str:
+    button = a.get("button", "left")
+    count = int(a.get("count", 1))
+    await run_vm_cmd(app.ssh, _click_cmd(display, button, count))
+    return f"click {button} x{count}"
+
+
+async def _act_move_mouse(app: "AppContext", display: str, a: dict) -> str:
+    x = int(a.get("x", 0))
+    y = int(a.get("y", 0))
+    mode = a.get("mode", "absolute")
+    sx, sy = _scale_input(app.calibration, x, y)
+    await run_vm_cmd(app.ssh, _move_cmd(display, sx, sy, mode))
+    return f"move_mouse ({x}, {y}) [{mode}]"
+
+
+async def _act_wait(app: "AppContext", display: str, a: dict) -> str:
+    seconds = a.get("seconds", 0.5)
+    await asyncio.sleep(seconds)
+    return f"wait {seconds}s"
+
+
+ACTION_HANDLERS = {
+    "press_keys": _act_press_keys,
+    "type_text": _act_type_text,
+    "click": _act_click,
+    "move_mouse": _act_move_mouse,
+    "wait": _act_wait,
+}
+
+
 @mcp.tool()
 async def run_actions(
     actions: list[dict],
@@ -763,47 +813,19 @@ async def run_actions(
         Summary of executed actions
     """
     app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
-    ssh = app_ctx.ssh
-    cal = app_ctx.calibration
+    display = shlex.quote(VM_DISPLAY)  # constant for the whole batch
     results = []
 
     for i, action_def in enumerate(actions):
         action_type = action_def.get("action")
+        handler = ACTION_HANDLERS.get(action_type)
 
         try:
-            display = shlex.quote(VM_DISPLAY)
-
-            if action_type == "press_keys":
-                keys = action_def.get("keys", [])
-                await run_vm_cmd(ssh, _keys_cmd(display, keys))
-                results.append(f"{i + 1}. press_keys {keys}")
-
-            elif action_type == "type_text":
-                text = action_def.get("text", "")
-                await _run_type(ssh, display, text)
-                results.append(f"{i + 1}. type_text ({len(text)} chars)")
-
-            elif action_type == "click":
-                button = action_def.get("button", "left")
-                count = int(action_def.get("count", 1))
-                await run_vm_cmd(ssh, _click_cmd(display, button, count))
-                results.append(f"{i + 1}. click {button} x{count}")
-
-            elif action_type == "move_mouse":
-                x = int(action_def.get("x", 0))
-                y = int(action_def.get("y", 0))
-                mode = action_def.get("mode", "absolute")
-                sx, sy = _scale_input(cal, x, y)
-                await run_vm_cmd(ssh, _move_cmd(display, sx, sy, mode))
-                results.append(f"{i + 1}. move_mouse ({x}, {y}) [{mode}]")
-
-            elif action_type == "wait":
-                seconds = action_def.get("seconds", 0.5)
-                await asyncio.sleep(seconds)
-                results.append(f"{i + 1}. wait {seconds}s")
-
-            else:
-                results.append(f"{i + 1}. UNKNOWN ACTION: {action_type}")
+            if handler is None:
+                valid = ", ".join(ACTION_HANDLERS)
+                raise ValueError(f"unknown action {action_type!r} (valid: {valid})")
+            summary = await handler(app_ctx, display, action_def)
+            results.append(f"{i + 1}. {summary}")
 
         except Exception as e:
             results.append(f"{i + 1}. ERROR in {action_type}: {str(e)}")

@@ -14,8 +14,14 @@ import pytest
 
 import server
 from server import (
+    ACTION_HANDLERS,
     DisplayCalibration,
     Project,
+    _act_click,
+    _act_move_mouse,
+    _act_press_keys,
+    _act_type_text,
+    _act_wait,
     _click_cmd,
     _keys_cmd,
     _move_cmd,
@@ -25,6 +31,7 @@ from server import (
     _scale_output,
     _type_cmd,
     get_screenshot,
+    run_actions,
 )
 
 DISPLAY_Q = "':0'"
@@ -45,6 +52,29 @@ class FakeSSH:
             returncode = 0
 
         return _Result()
+
+
+class FakeApp:
+    """Stand-in for AppContext: holds ssh, calibration, and project."""
+
+    def __init__(self, ssh, calibration=None, project=None):
+        self.ssh = ssh
+        self.calibration = calibration or DisplayCalibration(0, 0, 0, 0, 1.0, 1.0)
+        self.project = project
+
+
+class FakeCtx:
+    """Minimal Context whose lifespan_context is a FakeApp."""
+
+    def __init__(self, app):
+        rc = type("RC", (), {})()
+        rc.lifespan_context = app
+        self.request_context = rc
+
+
+def _cmds(ssh):
+    """Just the command strings sent to ssh.run()."""
+    return [cmd for cmd, _ in ssh.calls]
 
 
 # ---------- xdotool command builders ----------
@@ -145,6 +175,94 @@ def test_run_type_never_sends_literal_newline_to_xdotool():
     ssh = FakeSSH()
     asyncio.run(_run_type(ssh, DISPLAY_Q, "first\nsecond"))
     assert all("\n" not in (inp or "") for _, inp in ssh.calls)
+
+
+# ---------- run_actions batch dispatch (ACTION_HANDLERS registry) ----------
+
+
+def test_action_handlers_registry_is_canonical_set():
+    assert set(ACTION_HANDLERS) == {
+        "press_keys",
+        "type_text",
+        "click",
+        "move_mouse",
+        "wait",
+    }
+
+
+def test_act_click_runs_click_cmd_and_summarizes():
+    ssh = FakeSSH()
+    summary = asyncio.run(
+        _act_click(FakeApp(ssh), DISPLAY_Q, {"button": "right", "count": 2})
+    )
+    assert summary == "click right x2"
+    assert any("xdotool click --repeat 2 3" in c for c in _cmds(ssh))
+
+
+def test_act_move_mouse_scales_and_summarizes():
+    ssh = FakeSSH()
+    app = FakeApp(ssh, DisplayCalibration(0, 0, 0, 0, 2.0, 2.0))
+    summary = asyncio.run(
+        _act_move_mouse(app, DISPLAY_Q, {"x": 10, "y": 20, "mode": "absolute"})
+    )
+    assert summary == "move_mouse (10, 20) [absolute]"
+    assert any("mousemove --sync 20 40" in c for c in _cmds(ssh))
+
+
+def test_act_type_text_summarizes_and_handles_newlines():
+    ssh = FakeSSH()
+    summary = asyncio.run(_act_type_text(FakeApp(ssh), DISPLAY_Q, {"text": "a\nb"}))
+    assert summary == "type_text (3 chars)"
+    assert any("xdotool key Return" in c for c in _cmds(ssh))
+
+
+def test_act_press_keys_summary():
+    ssh = FakeSSH()
+    summary = asyncio.run(
+        _act_press_keys(FakeApp(ssh), DISPLAY_Q, {"keys": ["Ctrl", "a"]})
+    )
+    assert summary == "press_keys ['Ctrl', 'a']"
+
+
+def test_act_wait_summary():
+    summary = asyncio.run(_act_wait(FakeApp(FakeSSH()), DISPLAY_Q, {"seconds": 0}))
+    assert summary == "wait 0s"
+
+
+def test_run_actions_executes_sequence_in_order():
+    ssh = FakeSSH()
+    ctx = FakeCtx(FakeApp(ssh))
+    out = asyncio.run(
+        run_actions(
+            [
+                {"action": "press_keys", "keys": ["Ctrl", "a"]},
+                {"action": "type_text", "text": "hello"},
+                {"action": "wait", "seconds": 0},
+            ],
+            ctx=ctx,
+        )
+    )
+    assert "Executed 3 actions" in out
+    assert "1. press_keys" in out and "2. type_text" in out and "3. wait" in out
+
+
+def test_run_actions_unknown_action_errors_and_stops():
+    ssh = FakeSSH()
+    ctx = FakeCtx(FakeApp(ssh))
+    out = asyncio.run(
+        run_actions(
+            [
+                {"action": "click", "button": "left"},
+                {"action": "bogus"},
+                {"action": "wait", "seconds": 0},
+            ],
+            ctx=ctx,
+        )
+    )
+    assert "ERROR in bogus" in out
+    assert "unknown action" in out
+    # stopped before reaching the 3rd action (wait)
+    assert "3." not in out
 
 
 # ---------- coordinate scaling ----------
