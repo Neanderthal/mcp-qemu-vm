@@ -160,11 +160,18 @@ class Project:
         return self.path / "screenshots" / f"{screenshot_id}.png"
 
     def save_result(self, filename: str, content: str) -> pathlib.Path:
-        """Save a result file to the project."""
-        result_path = self.path / "results" / filename
+        """Save a result file to the project.
+
+        The filename is reduced to its basename to prevent path traversal
+        (e.g. ``../../etc/passwd``) escaping the results directory.
+        """
+        safe_name = pathlib.Path(filename).name
+        if not safe_name or safe_name in (".", ".."):
+            raise ValueError(f"Invalid result filename: {filename!r}")
+        result_path = self.path / "results" / safe_name
         with open(result_path, "w") as f:
             f.write(content)
-        self._log(f"Result saved: {filename}")
+        self._log(f"Result saved: {safe_name}")
         return result_path
 
     def save_advice(self, title: str, content: str) -> pathlib.Path:
