@@ -1140,12 +1140,13 @@ async def run_actions(
 
     🚀 RECOMMENDED for nested/remote environments (Citrix, VMs)!
     Benefits:
-    - Reduces round-trip latency (5 actions in 1 call vs 5 separate calls)
+    - Reduces round-trip latency (the whole batch runs over one SSH call)
     - Critical for high-latency environments
-    - Ensures sequential execution, stops on first error
-    - Actions execute reliably in order
+    - Runs sequentially in order; stops on the first error (an unknown action
+      name is an error and halts the batch)
 
-    Each action is a dict with "action" key and action-specific parameters.
+    Each action is a dict with an "action" key plus that action's parameters.
+    The same parameters as the standalone tools apply.
 
     Supported actions:
     - {"action": "press_keys", "keys": ["Ctrl", "Shift", "p"]}
@@ -1162,14 +1163,21 @@ async def run_actions(
     - {"action": "paste", "text": "hello"}  # "text" optional
     - {"action": "wait", "seconds": 0.5}
 
-    Example - switch to VS Code terminal reliably:
+    Example - focus a window, paste text, and capture the result:
     [
-        {"action": "press_keys", "keys": ["Ctrl", "Shift", "p"]},
-        {"action": "wait", "seconds": 0.5},
-        {"action": "type_text", "text": "Terminal: Focus Terminal"},
+        {"action": "activate_window", "title": "Mousepad"},
         {"action": "wait", "seconds": 0.3},
-        {"action": "press_keys", "keys": ["Return"]},
-        {"action": "wait", "seconds": 0.5}
+        {"action": "paste", "text": "Hello from the clipboard"},
+        {"action": "wait", "seconds": 0.3},
+        {"action": "screenshot"}
+    ]
+
+    Example - hold Shift to select to end of line (key_down/key_up):
+    [
+        {"action": "press_keys", "keys": ["Home"]},
+        {"action": "key_down", "keys": ["shift"]},
+        {"action": "press_keys", "keys": ["End"]},
+        {"action": "key_up", "keys": ["shift"]}
     ]
 
     Returns:
