@@ -310,8 +310,10 @@ Projects organize all outputs (screenshots, logs, results, advice) into timestam
 | Tool | Description |
 |------|-------------|
 | `move_mouse(x, y, mode)` | Move cursor (mode: "absolute" or "relative") |
-| `click(button, count)` | Click mouse button (left/middle/right) |
-| `type_text(text)` | Type text |
+| `click(button, count, x, y)` | Click a button; optional `x, y` move-and-click in one op |
+| `scroll(direction, amount)` | Mouse-wheel scroll (up/down/left/right) at cursor |
+| `drag(x1, y1, x2, y2, button)` | Press at start, drag to end, release (select/slider/DnD) |
+| `type_text(text)` | Type text (newlines → Return, UTF-8 safe) |
 | `press_keys(keys)` | Press key combo, e.g., `["Ctrl", "L"]` |
 | `wait(seconds)` | Pause execution |
 | `run_actions(actions)` | Execute a sequence of actions in one call |

@@ -18,17 +18,22 @@ from server import (
     DisplayCalibration,
     Project,
     _act_click,
+    _act_drag,
     _act_move_mouse,
     _act_press_keys,
+    _act_scroll,
     _act_type_text,
     _act_wait,
+    _click_at_cmd,
     _click_cmd,
+    _drag_cmd,
     _keys_cmd,
     _move_cmd,
     _parse_frame_extents,
     _run_type,
     _scale_input,
     _scale_output,
+    _scroll_cmd,
     _type_cmd,
     get_screenshot,
     run_actions,
@@ -129,6 +134,50 @@ def test_move_cmd_rejects_bad_mode():
         _move_cmd(DISPLAY_Q, 0, 0, "sideways")
 
 
+# ---------- scroll / drag / click-at-xy builders ----------
+
+
+@pytest.mark.parametrize(
+    "direction,btn", [("up", 4), ("down", 5), ("left", 6), ("right", 7)]
+)
+def test_scroll_cmd_maps_direction_to_button(direction, btn):
+    assert _scroll_cmd(DISPLAY_Q, direction, 3).endswith(f"--repeat 3 {btn}")
+
+
+def test_scroll_cmd_clamps_amount():
+    assert "--repeat 1 5" in _scroll_cmd(DISPLAY_Q, "down", 0)
+
+
+def test_scroll_cmd_rejects_bad_direction():
+    with pytest.raises(ValueError, match="up/down/left/right"):
+        _scroll_cmd(DISPLAY_Q, "diagonal", 1)
+
+
+def test_click_at_cmd_moves_then_clicks():
+    cmd = _click_at_cmd(DISPLAY_Q, 50, 60, "left", 1)
+    move_idx = cmd.index("mousemove --sync 50 60")
+    click_idx = cmd.index("xdotool click")
+    assert move_idx < click_idx
+    assert " && " in cmd
+
+
+def test_drag_cmd_sequence_and_button():
+    cmd = _drag_cmd(DISPLAY_Q, 10, 20, 30, 40, "left")
+    # press at start, move to end, release — in that order
+    order = [
+        cmd.index("mousemove --sync 10 20"),
+        cmd.index("mousedown 1"),
+        cmd.index("mousemove --sync 30 40"),
+        cmd.index("mouseup 1"),
+    ]
+    assert order == sorted(order)
+
+
+def test_drag_cmd_rejects_bad_button():
+    with pytest.raises(ValueError, match="left/middle/right"):
+        _drag_cmd(DISPLAY_Q, 0, 0, 1, 1, "scroll")
+
+
 # ---------- typing with newline handling (README Known Issues #2) ----------
 
 
@@ -186,8 +235,48 @@ def test_action_handlers_registry_is_canonical_set():
         "type_text",
         "click",
         "move_mouse",
+        "scroll",
+        "drag",
         "wait",
     }
+
+
+def test_act_scroll_summary_and_command():
+    ssh = FakeSSH()
+    summary = asyncio.run(
+        _act_scroll(FakeApp(ssh), DISPLAY_Q, {"direction": "down", "amount": 4})
+    )
+    assert summary == "scroll down x4"
+    assert any("--repeat 4 5" in c for c in _cmds(ssh))
+
+
+def test_act_drag_scales_and_summarizes():
+    ssh = FakeSSH()
+    app = FakeApp(ssh, DisplayCalibration(0, 0, 0, 0, 2.0, 2.0))
+    summary = asyncio.run(
+        _act_drag(app, DISPLAY_Q, {"x1": 10, "y1": 20, "x2": 30, "y2": 40})
+    )
+    assert summary == "drag left (10, 20) -> (30, 40)"
+    cmds = _cmds(ssh)
+    assert any("mousemove --sync 20 40" in c for c in cmds)  # scaled start
+    assert any("mousemove --sync 60 80" in c for c in cmds)  # scaled end
+    assert any("mousedown 1" in c for c in cmds)
+
+
+def test_act_click_with_xy_moves_then_clicks():
+    ssh = FakeSSH()
+    summary = asyncio.run(
+        _act_click(FakeApp(ssh), DISPLAY_Q, {"x": 100, "y": 200, "button": "left"})
+    )
+    assert summary == "click left x1 at (100, 200)"
+    assert any("mousemove --sync 100 200" in c for c in _cmds(ssh))
+
+
+def test_act_click_without_xy_clicks_in_place():
+    ssh = FakeSSH()
+    summary = asyncio.run(_act_click(FakeApp(ssh), DISPLAY_Q, {"button": "left"}))
+    assert summary == "click left x1"
+    assert all("mousemove" not in c for c in _cmds(ssh))
 
 
 def test_act_click_runs_click_cmd_and_summarizes():
