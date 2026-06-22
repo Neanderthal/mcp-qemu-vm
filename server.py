@@ -1179,7 +1179,8 @@ Description: {info["description"] or "(none)"}
 Folders created:
 - screenshots/
 - logs/
-- results/"""
+- results/
+- advice/"""
 
 
 @mcp.tool()
@@ -1471,6 +1472,9 @@ async def take_screenshot(
     local_path = project.screenshot_path(sid)
     async with ssh.start_sftp_client() as sftp:
         await sftp.get(remote_path, str(local_path))
+
+    # Remove the remote temp file so screenshots don't accumulate in /tmp.
+    await run_vm_cmd(ssh, f"rm -f {shlex.quote(remote_path)}")
 
     project._log(f"Screenshot captured: {sid}")
     resource_uri = f"vm://screenshot/{sid}"
