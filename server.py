@@ -1484,6 +1484,12 @@ async def get_screenshot(sid: str) -> bytes:
     Return a screenshot by ID as binary data.
     Searches in all project folders.
     """
+    # Screenshot IDs are generated as a UTC timestamp ("%Y%m%d-%H%M%S-%f"),
+    # i.e. only digits and dashes. Reject anything else so a crafted sid
+    # (e.g. "../../etc/passwd") cannot escape the screenshots directory.
+    if not re.fullmatch(r"[0-9-]+", sid):
+        raise FileNotFoundError(f"No screenshot found for id {sid}")
+
     # Search in all projects for this screenshot
     for project_dir in PROJECTS_DIR.iterdir():
         if project_dir.is_dir():
