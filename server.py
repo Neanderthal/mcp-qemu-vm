@@ -1154,6 +1154,12 @@ async def run_actions(
     - {"action": "move_mouse", "x": 100, "y": 200, "mode": "absolute"}
     - {"action": "scroll", "direction": "down", "amount": 3}
     - {"action": "drag", "x1": 100, "y1": 200, "x2": 400, "y2": 200}
+    - {"action": "key_down", "keys": ["shift"]}
+    - {"action": "key_up", "keys": ["shift"]}
+    - {"action": "activate_window", "title": "Mousepad"}  # or "window_id"
+    - {"action": "screenshot"}
+    - {"action": "set_clipboard", "text": "hello"}
+    - {"action": "paste", "text": "hello"}  # "text" optional
     - {"action": "wait", "seconds": 0.5}
 
     Example - switch to VS Code terminal reliably:

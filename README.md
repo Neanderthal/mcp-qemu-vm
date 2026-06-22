@@ -315,6 +315,10 @@ Projects organize all outputs (screenshots, logs, results, advice) into timestam
 | `drag(x1, y1, x2, y2, button)` | Press at start, drag to end, release (select/slider/DnD) |
 | `type_text(text)` | Type text (newlines → Return, UTF-8 safe) |
 | `press_keys(keys)` | Press key combo, e.g., `["Ctrl", "L"]` |
+| `key_down(keys)` / `key_up(keys)` | Hold / release a key or modifier (e.g. Shift-click) |
+| `set_clipboard(text)` | Load the VM clipboard (fast insert for big ASCII) |
+| `paste(text)` | Set clipboard (if `text`) and Ctrl+V |
+| `activate_window(title, window_id)` | Focus & raise a window by title or id |
 | `wait(seconds)` | Pause execution |
 | `run_actions(actions)` | Execute a sequence of actions in one call |
 
