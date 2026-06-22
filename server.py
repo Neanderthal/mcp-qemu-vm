@@ -286,6 +286,34 @@ async def run_vm_cmd(
     return (result.stdout or "").strip()
 
 
+async def _run_type(
+    ssh: asyncssh.SSHClientConnection,
+    display_q: str,
+    text: str,
+) -> None:
+    """Type *text* into the VM, one line at a time.
+
+    Newlines are sent as explicit ``Return`` key presses rather than typed as a
+    literal LF. In nested / rich-editor contexts (Citrix -> Windows -> Outlook) a
+    literal LF from ``xdotool type`` is delivered as a stray control-character
+    glyph instead of a paragraph break (README Known Issues #2). Splitting on
+    newlines and pressing Return is robust in both terminals and rich editors.
+
+    Each line's text still goes to xdotool via stdin (--file -), so it never
+    touches the shell.
+    """
+    # Normalise CRLF / CR so we only split on \n.
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    segments = normalized.split("\n")
+    type_cmd = _type_cmd(display_q)
+    return_cmd = f"DISPLAY={display_q} xdotool key Return"
+    for idx, segment in enumerate(segments):
+        if segment:
+            await ssh.run(type_cmd, input=segment, check=True)
+        if idx < len(segments) - 1:
+            await run_vm_cmd(ssh, return_cmd)
+
+
 async def _calibrate_display(
     ssh: asyncssh.SSHClientConnection,
 ) -> DisplayCalibration:
@@ -632,12 +660,13 @@ async def type_text(
     - No cursor visible = STOP and screenshot first
 
     The text is typed with 10ms delay between characters for reliability.
+    Newlines are sent as explicit Return key presses (not a literal LF), so
+    multi-line text produces real line breaks in both terminals and rich editors.
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
     # Text goes to stdin via --file -, never touches the shell
     display = shlex.quote(VM_DISPLAY)
-    cmd = _type_cmd(display)
-    await ssh.run(cmd, input=text, check=True)
+    await _run_type(ssh, display, text)
     # Mask sensitive text in logs (only show length)
     log_text = text if len(text) <= 20 else f"{text[:10]}...({len(text)} chars)"
     _log_tool_call(ctx, "type_text", {"text": log_text})
@@ -751,7 +780,7 @@ async def run_actions(
 
             elif action_type == "type_text":
                 text = action_def.get("text", "")
-                await ssh.run(_type_cmd(display), input=text, check=True)
+                await _run_type(ssh, display, text)
                 results.append(f"{i + 1}. type_text ({len(text)} chars)")
 
             elif action_type == "click":

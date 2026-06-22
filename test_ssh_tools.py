@@ -20,6 +20,7 @@ from server import (
     _keys_cmd,
     _move_cmd,
     _parse_frame_extents,
+    _run_type,
     _scale_input,
     _scale_output,
     _type_cmd,
@@ -27,6 +28,23 @@ from server import (
 )
 
 DISPLAY_Q = "':0'"
+
+
+class FakeSSH:
+    """Records every ssh.run() invocation as (cmd, input)."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, str | None]] = []
+
+    async def run(self, cmd, *, input=None, check=False):  # noqa: A002
+        self.calls.append((cmd, input))
+
+        class _Result:
+            stdout = ""
+            stderr = ""
+            returncode = 0
+
+        return _Result()
 
 
 # ---------- xdotool command builders ----------
@@ -79,6 +97,54 @@ def test_move_cmd_absolute_and_relative():
 def test_move_cmd_rejects_bad_mode():
     with pytest.raises(ValueError, match="absolute"):
         _move_cmd(DISPLAY_Q, 0, 0, "sideways")
+
+
+# ---------- typing with newline handling (README Known Issues #2) ----------
+
+
+def _type_inputs(ssh):
+    """Text passed to xdotool type, in order (skips key/Return commands)."""
+    return [inp for cmd, inp in ssh.calls if "xdotool type" in cmd]
+
+
+def test_run_type_single_line_no_return():
+    ssh = FakeSSH()
+    asyncio.run(_run_type(ssh, DISPLAY_Q, "hello world"))
+    assert len(ssh.calls) == 1
+    assert ssh.calls[0][1] == "hello world"
+    assert "xdotool type" in ssh.calls[0][0]
+
+
+def test_run_type_multiline_presses_return_between_lines():
+    ssh = FakeSSH()
+    asyncio.run(_run_type(ssh, DISPLAY_Q, "line1\nline2\nline3"))
+    # type line1, Return, type line2, Return, type line3
+    assert _type_inputs(ssh) == ["line1", "line2", "line3"]
+    returns = [cmd for cmd, _ in ssh.calls if "xdotool key Return" in cmd]
+    assert len(returns) == 2
+
+
+def test_run_type_blank_line_presses_return_without_typing():
+    ssh = FakeSSH()
+    asyncio.run(_run_type(ssh, DISPLAY_Q, "a\n\nb"))
+    # ["a", "", "b"] -> type a, Return, Return, type b
+    assert _type_inputs(ssh) == ["a", "b"]
+    returns = [cmd for cmd, _ in ssh.calls if "xdotool key Return" in cmd]
+    assert len(returns) == 2
+
+
+def test_run_type_normalizes_crlf_and_cr():
+    for text in ("a\r\nb", "a\rb"):
+        ssh = FakeSSH()
+        asyncio.run(_run_type(ssh, DISPLAY_Q, text))
+        assert _type_inputs(ssh) == ["a", "b"]
+        assert any("xdotool key Return" in cmd for cmd, _ in ssh.calls)
+
+
+def test_run_type_never_sends_literal_newline_to_xdotool():
+    ssh = FakeSSH()
+    asyncio.run(_run_type(ssh, DISPLAY_Q, "first\nsecond"))
+    assert all("\n" not in (inp or "") for _, inp in ssh.calls)
 
 
 # ---------- coordinate scaling ----------
