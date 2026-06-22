@@ -321,6 +321,7 @@ class AppContext:
     calibration: DisplayCalibration
     project: Project | None = None
     last_zoom: ZoomRegion | None = None  # set by zoom(), used by click_zoomed()
+    last_marks: list[dict] | None = None  # set by mark_screen(), used by click_mark()
 
 
 async def connect_ssh() -> asyncssh.SSHClientConnection:
@@ -601,6 +602,82 @@ def _crop_zoom(
     buf = io.BytesIO()
     zimg.save(buf, format="PNG")
     return buf.getvalue(), region
+
+
+# ---------- Set-of-Mark (numbered overlays for pick-by-number) ----------
+# Overlay numbered marks on detected text so the model picks an INDEX (a
+# classification it's good at) instead of estimating coordinates. Candidates
+# come from OCR; click_mark(n) clicks the stored center of mark n.
+
+
+def _build_marks(
+    words: list[dict], min_conf: float = 50.0, max_marks: int = 80
+) -> list[dict]:
+    """Turn OCR words into numbered marks in reading order.
+
+    Filters by confidence, sorts top-to-bottom/left-to-right, caps at max_marks,
+    and assigns sequential ids. Each mark carries its box, center, and text.
+    Pure/synchronous — unit-testable without OCR or a VM.
+    """
+    cands = [w for w in words if w["conf"] >= min_conf and w["text"].strip()]
+    cands.sort(key=lambda w: (w["top"], w["left"]))
+    marks: list[dict] = []
+    for i, w in enumerate(cands[: max(0, int(max_marks))]):
+        marks.append(
+            {
+                "id": i,
+                "text": w["text"],
+                "left": w["left"],
+                "top": w["top"],
+                "width": w["width"],
+                "height": w["height"],
+                "cx": w["left"] + w["width"] // 2,
+                "cy": w["top"] + w["height"] // 2,
+            }
+        )
+    return marks
+
+
+def _render_marks(png_bytes: bytes, marks: list[dict]) -> bytes:
+    """Draw numbered red boxes/labels on the screenshot for each mark.
+
+    PIL is lazy-imported. CPU-bound — call via asyncio.to_thread.
+    """
+    try:
+        import io
+
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as exc:  # pragma: no cover - depends on host install
+        raise RuntimeError("mark_screen needs Pillow on the host") from exc
+
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    font = None
+    for name in ("DejaVuSans-Bold.ttf", "DejaVuSans.ttf"):
+        try:
+            font = ImageFont.truetype(name, 16)
+            break
+        except OSError:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+
+    for m in marks:
+        x0, y0 = m["left"], m["top"]
+        x1, y1 = x0 + m["width"], y0 + m["height"]
+        draw.rectangle((x0, y0, x1, y1), outline=(255, 0, 0), width=2)
+        label = str(m["id"])
+        try:
+            tw = int(draw.textlength(label, font=font))
+        except (AttributeError, TypeError):  # very old Pillow
+            tw = 9 * len(label)
+        ly = max(0, y0 - 17)
+        draw.rectangle((x0, ly, x0 + tw + 4, ly + 16), fill=(255, 0, 0))
+        draw.text((x0 + 2, ly), label, fill=(255, 255, 255), font=font)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 async def _calibrate_display(
@@ -1130,6 +1207,91 @@ async def click_zoomed(
 
     result = f"Clicked zoomed ({int(zx)}, {int(zy)}) -> screen ({fx}, {fy})"
     _log_tool_call(ctx, "click_zoomed", {"zx": zx, "zy": zy}, result)
+    return result
+
+
+@mcp.tool()
+async def mark_screen(
+    min_conf: float = 50.0,
+    max_marks: int = 80,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Overlay numbered marks on detected on-screen text — then pick by NUMBER.
+
+    Captures the screen, OCRs it, draws a numbered red box on each text element,
+    and saves the annotated image as a resource. View it, then click the element
+    you want with click_mark(n) — you choose an index instead of estimating
+    coordinates, which is far more reliable for dense/ambiguous UIs.
+
+    The text legend (id -> text -> center) is also returned. Raise min_conf or
+    lower max_marks if the result is too cluttered. Requires an active project.
+
+    Args:
+        min_conf: Minimum OCR confidence 0-100 to mark an element (default 50)
+        max_marks: Cap on number of marks (default 80)
+
+    Returns:
+        Annotated image resource URI plus the numbered legend.
+    """
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    project = _get_project(ctx)  # type: ignore[arg-type]
+
+    png = await _grab_png(app_ctx.ssh)
+    words = await asyncio.to_thread(_ocr_words, png)
+    marks = _build_marks(words, min_conf, max_marks)
+    if not marks:
+        return "No text detected to mark (try lowering min_conf)."
+
+    annotated = await asyncio.to_thread(_render_marks, png, marks)
+    app_ctx.last_marks = marks
+
+    sid = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S-%f")
+    project.screenshot_path(sid).write_bytes(annotated)
+    project._log(f"Marked {len(marks)} elements: {sid}")
+
+    legend = "\n".join(
+        f"  [{m['id']}] {m['text']!r} ({m['cx']}, {m['cy']})" for m in marks
+    )
+    _log_tool_call(ctx, "mark_screen", {"count": len(marks)})
+    return (
+        f"Marked {len(marks)} elements.\n"
+        f"Resource URI: vm://screenshot/{sid}\n"
+        f"{legend}\n"
+        f"Click one with click_mark(n)."
+    )
+
+
+@mcp.tool()
+async def click_mark(
+    n: int,
+    button: str = "left",
+    count: int = 1,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Click the element labeled `n` from the most recent mark_screen().
+
+    Args:
+        n: The mark number shown in the annotated image / legend
+        button: left/right/middle
+        count: Click count (2 = double-click)
+    """
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    marks = app_ctx.last_marks
+    if not marks:
+        return "Error: no marks; call mark_screen() first."
+
+    mark = next((m for m in marks if m["id"] == int(n)), None)
+    if mark is None:
+        return f"No mark {n}; valid range is 0..{len(marks) - 1}."
+
+    sx, sy = _scale_input(app_ctx.calibration, mark["cx"], mark["cy"])
+    display = shlex.quote(VM_DISPLAY)
+    await run_vm_cmd(app_ctx.ssh, _click_at_cmd(display, sx, sy, button, int(count)))
+
+    result = f"Clicked mark [{n}] {mark['text']!r} at ({mark['cx']}, {mark['cy']})"
+    _log_tool_call(ctx, "click_mark", {"n": n}, result)
     return result
 
 

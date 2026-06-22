@@ -369,6 +369,22 @@ zoom(800, 600, width=400, height=300, scale=4)  # view a 4× magnified crop
 click_zoomed(610, 250)                           # click that spot → exact full-screen pixel
 ```
 
+### Set-of-Mark (pick by number)
+
+For dense or ambiguous screens, overlay **numbered marks** on every detected text
+element and pick one by its number — a discrete choice that's far more reliable
+than estimating coordinates.
+
+| Tool | Description |
+|------|-------------|
+| `mark_screen(min_conf, max_marks)` | Annotate the screen with numbered boxes; returns the image + a legend |
+| `click_mark(n, button, count)` | Click the element labeled `n` |
+
+```python
+mark_screen()        # view the annotated screenshot + legend (0 -> "File", 1 -> "Edit", …)
+click_mark(1)        # click element #1 at its exact center
+```
+
 **Host requirements:** `tesseract` (the binary) plus `pillow` and `pytesseract`
 in the server's Python env. These are optional — the rest of the server runs
 without them; only the OCR (`find_text`/`click_text`) and zoom (`zoom`) tools
