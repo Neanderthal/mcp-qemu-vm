@@ -563,7 +563,7 @@ ip addr show virbr0
 
 ## License
 
-MIT
+Released under the [MIT License](LICENSE) — © 2026 Sergey Istomin.
 
 ## Related
 
