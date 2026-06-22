@@ -479,6 +479,42 @@ run_actions([
 └────────────────────────────────────────────────────┘
 ```
 
+### UI Action Dispatch
+
+All xdotool interactions are built from a small set of pure **command builders**
+(`_type_cmd`, `_keys_cmd`, `_click_cmd`, `_move_cmd`) so the shell command for an
+action is constructed in exactly one place. Each builder takes an already
+`shlex.quote()`d display string and returns the command to run on the VM; the
+builders also own input validation (key-name pattern, button map, click-count
+clamp) and the UTF-8 locale prefix for typing.
+
+Two paths consume these builders:
+
+- **Standalone tools** (`move_mouse`, `click`, `type_text`, `press_keys`, `wait`)
+  — individually exposed MCP tools with typed signatures and rich docstrings.
+- **`run_actions`** — the batch path. It dispatches through `ACTION_HANDLERS`,
+  a `{name: async handler}` registry that is the **single source of truth** for
+  which actions a batch supports. Each handler shares the signature
+  `async (app_ctx, display, action_dict) -> summary`. Unknown action names raise
+  and stop the batch (consistent with its "stops on first error" contract).
+
+```
+run_actions(actions)
+      │  for each action
+      ▼
+ACTION_HANDLERS[name]  ──►  _act_*(app, display, action)
+                                   │ uses
+                                   ▼
+                       _type_cmd / _keys_cmd / _click_cmd / _move_cmd
+                                   │
+                                   ▼
+                             run_vm_cmd(ssh, …)  ──►  xdotool over SSH
+```
+
+**Adding a new batch action:** write a `_act_<name>(app, display, action)` handler
+(reusing or adding a `_*_cmd` builder) and add one entry to `ACTION_HANDLERS`. No
+changes to the dispatch loop are needed.
+
 ### Project Structure
 ```
 mcp-qemu-vm/
@@ -486,6 +522,8 @@ mcp-qemu-vm/
 ├── pyproject.toml      # Project metadata, ruff & pytest config
 ├── requirements.txt    # Python dependencies
 ├── .env.example        # Documented env var template
+├── test_ssh_tools.py   # Unit tests (no-VM) + manual SSH smoke check
+├── LICENSE             # MIT
 ├── data/
 │   └── projects/       # Project folders
 │       └── YYYYMMDD-HHMMSS_name/
