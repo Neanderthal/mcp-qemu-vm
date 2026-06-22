@@ -28,8 +28,26 @@ The calibration probe runs `xdotool getdisplaygeometry`, `scrot`, `file`, and `r
 - `connect_timeout` defaults to 10s, configurable via `VM_CONNECT_TIMEOUT`
 - Keepalive: `interval=30, count_max=3` prevents idle disconnects
 
+## Path Traversal Prevention
+
+User/LLM-supplied filenames are never joined to a directory as-is.
+
+- `project_save_result()` reduces the filename to its basename
+  (`pathlib.Path(name).name`) and rejects empty / `.` / `..` before writing.
+- The `vm://screenshot/{sid}` resource validates `sid` against `[0-9-]+`
+  (the generated timestamp format) before touching the filesystem.
+- `save_advice()` strips non-alphanumeric chars from the title for the filename.
+
+## Logging
+
+- `type_text` logs only the length of long text, never the content.
+- `ssh_execute` logs the command string (truncated to 100 chars). Avoid passing
+  secrets inline on the command line (e.g. `mysql -pPASSWORD`); prefer env files
+  or stdin so credentials don't land in `project.log`.
+
 ## Environment Variables
 
 - `.env` is gitignored — never commit credentials
 - `VM_IDENTITY` (private key path) is optional and sensitive
+- `VM_LOCALE` sets the UTF-8 locale forced for `xdotool type` (default `C.UTF-8`)
 - See `.env.example` for all supported variables
