@@ -24,6 +24,7 @@ from server import (
     _act_key_up,
     _act_move_mouse,
     _act_press_keys,
+    _act_screenshot,
     _act_scroll,
     _act_type_text,
     _act_wait,
@@ -36,6 +37,7 @@ from server import (
     _parse_frame_extents,
     _run_type,
     _activate_window,
+    _capture_screenshot,
     _scale_input,
     _scale_output,
     _scroll_cmd,
@@ -264,6 +266,7 @@ def test_action_handlers_registry_is_canonical_set():
         "key_down",
         "key_up",
         "activate_window",
+        "screenshot",
         "wait",
     }
 
@@ -388,6 +391,20 @@ def test_act_activate_window_delegates():
         _act_activate_window(FakeApp(ssh), DISPLAY_Q, {"window_id": 7})
     )
     assert result.startswith("activated window 7:")
+
+
+# ---------- screenshot as a batch action ----------
+
+
+def test_capture_screenshot_requires_project():
+    # app.project is None -> guard fires before any scrot/SFTP
+    with pytest.raises(ValueError, match="No project initialized"):
+        asyncio.run(_capture_screenshot(FakeApp(FakeSSH(), project=None)))
+
+
+def test_act_screenshot_requires_project():
+    with pytest.raises(ValueError, match="No project initialized"):
+        asyncio.run(_act_screenshot(FakeApp(FakeSSH(), project=None), DISPLAY_Q, {}))
 
 
 def test_act_wait_summary():

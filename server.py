@@ -1030,6 +1030,11 @@ async def _act_activate_window(app: "AppContext", display: str, a: dict) -> str:
     )
 
 
+async def _act_screenshot(app: "AppContext", display: str, a: dict) -> str:
+    _, sid = await _capture_screenshot(app)
+    return f"screenshot -> vm://screenshot/{sid}"
+
+
 async def _act_wait(app: "AppContext", display: str, a: dict) -> str:
     seconds = a.get("seconds", 0.5)
     await asyncio.sleep(seconds)
@@ -1046,6 +1051,7 @@ ACTION_HANDLERS = {
     "key_down": _act_key_down,
     "key_up": _act_key_up,
     "activate_window": _act_activate_window,
+    "screenshot": _act_screenshot,
     "wait": _act_wait,
 }
 
@@ -1760,6 +1766,34 @@ Results: {info["result_count"]}"""
 # ---------- Screenshot tools + resources ----------
 
 
+async def _capture_screenshot(app_ctx: AppContext) -> tuple[pathlib.Path, str]:
+    """Capture a full-screen screenshot into the active project.
+
+    Runs scrot on the VM, downloads the PNG via SFTP, removes the remote temp
+    file, and returns (local_path, screenshot_id). Raises ValueError if no
+    project is active. Shared by take_screenshot() and the batch handler.
+    """
+    project = app_ctx.project
+    if project is None:
+        raise ValueError("No project initialized. Call project_init first.")
+    ssh = app_ctx.ssh
+
+    sid = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S-%f")
+    remote_path = f"/tmp/mcp-screenshot-{sid}.png"
+    display = shlex.quote(VM_DISPLAY)
+    await run_vm_cmd(ssh, f"DISPLAY={display} scrot {shlex.quote(remote_path)}")
+
+    local_path = project.screenshot_path(sid)
+    async with ssh.start_sftp_client() as sftp:
+        await sftp.get(remote_path, str(local_path))
+
+    # Remove the remote temp file so screenshots don't accumulate in /tmp.
+    await run_vm_cmd(ssh, f"rm -f {shlex.quote(remote_path)}")
+
+    project._log(f"Screenshot captured: {sid}")
+    return local_path, sid
+
+
 @mcp.tool()
 async def take_screenshot(
     ctx: Context[ServerSession, AppContext] | None = None,
@@ -1787,26 +1821,8 @@ async def take_screenshot(
         Screenshot path and resource URI for viewing
     """
     app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
-    project = _get_project(ctx)  # type: ignore[arg-type]
-    ssh = app_ctx.ssh
-
-    sid = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S-%f")
-    remote_path = f"/tmp/mcp-screenshot-{sid}.png"
-    display = shlex.quote(VM_DISPLAY)
-    cmd = f"DISPLAY={display} scrot {shlex.quote(remote_path)}"
-    await run_vm_cmd(ssh, cmd)
-
-    # download via SFTP to project folder
-    local_path = project.screenshot_path(sid)
-    async with ssh.start_sftp_client() as sftp:
-        await sftp.get(remote_path, str(local_path))
-
-    # Remove the remote temp file so screenshots don't accumulate in /tmp.
-    await run_vm_cmd(ssh, f"rm -f {shlex.quote(remote_path)}")
-
-    project._log(f"Screenshot captured: {sid}")
-    resource_uri = f"vm://screenshot/{sid}"
-    return f"Screenshot captured: {local_path}\nResource URI: {resource_uri}"
+    local_path, sid = await _capture_screenshot(app_ctx)
+    return f"Screenshot captured: {local_path}\nResource URI: vm://screenshot/{sid}"
 
 
 # Expose screenshots as resources
