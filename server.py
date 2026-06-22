@@ -5,6 +5,7 @@ import os
 import pathlib
 import re
 import shlex
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -20,6 +21,10 @@ VM_PORT = int(os.getenv("VM_PORT", "22"))
 VM_DISPLAY = os.getenv("VM_DISPLAY", ":0")
 VM_IDENTITY = os.getenv("VM_IDENTITY", "")  # path to private key, optional
 VM_DESKTOP_USER = os.getenv("VM_DESKTOP_USER", "")  # if different from VM_USER
+# UTF-8 locale for `xdotool type`. The vmrobot/desktop SSH environment often has
+# no UTF-8 LC_CTYPE, so multi-byte input (Cyrillic, etc.) fails with "Invalid
+# multi-byte sequence". Forcing LC_ALL here makes type_text work for non-ASCII.
+VM_LOCALE = os.getenv("VM_LOCALE", "C.UTF-8")
 
 PROJECTS_DIR = pathlib.Path("data/projects")
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -27,6 +32,52 @@ PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 # Every legitimate xdotool key name (Return, BackSpace, Ctrl, F12, KP_Enter, space)
 # matches this pattern. Rejects shell metacharacters like ; $ ` |
 VALID_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
+
+# xdotool button numbers
+BUTTON_MAP = {"left": 1, "middle": 2, "right": 3}
+
+
+# ---------- xdotool command builders ----------
+# Shared by the standalone tools and the run_actions() batch loop so the two
+# never diverge. Each takes an already-shlex-quoted display string and returns
+# a shell command to run on the VM. Caller is responsible for execution.
+
+
+def _type_cmd(display_q: str) -> str:
+    """Build the `xdotool type` command. Text is piped via stdin (--file -),
+    so it never touches the shell. LC_ALL forces a UTF-8 locale so non-ASCII
+    (Cyrillic, etc.) decodes correctly."""
+    return (
+        f"LC_ALL={shlex.quote(VM_LOCALE)} DISPLAY={display_q} "
+        "xdotool type --delay 10 --clearmodifiers --file -"
+    )
+
+
+def _keys_cmd(display_q: str, keys: list[str]) -> str:
+    """Build an `xdotool key` command from a validated key list."""
+    for k in keys:
+        if not VALID_KEY_PATTERN.match(k):
+            raise ValueError(f"Invalid key name: {k!r}")
+    combo = "+".join(k.lower() for k in keys)
+    return f"DISPLAY={display_q} xdotool key {shlex.quote(combo)}"
+
+
+def _click_cmd(display_q: str, button: str, count: int) -> str:
+    """Build an `xdotool click` command. Count is clamped to >= 1 (xdotool
+    rejects --repeat 0)."""
+    if button not in BUTTON_MAP:
+        raise ValueError("button must be left/middle/right")
+    count = max(1, int(count))
+    return f"DISPLAY={display_q} xdotool click --repeat {count} {BUTTON_MAP[button]}"
+
+
+def _move_cmd(display_q: str, sx: int, sy: int, mode: str) -> str:
+    """Build an `xdotool mousemove` command (absolute or relative)."""
+    if mode == "absolute":
+        return f"DISPLAY={display_q} xdotool mousemove --sync {sx} {sy}"
+    if mode == "relative":
+        return f"DISPLAY={display_q} xdotool mousemove_relative --sync {sx} {sy}"
+    raise ValueError("mode must be 'absolute' or 'relative'")
 
 
 # ---------- Project Management ----------
@@ -109,11 +160,18 @@ class Project:
         return self.path / "screenshots" / f"{screenshot_id}.png"
 
     def save_result(self, filename: str, content: str) -> pathlib.Path:
-        """Save a result file to the project."""
-        result_path = self.path / "results" / filename
+        """Save a result file to the project.
+
+        The filename is reduced to its basename to prevent path traversal
+        (e.g. ``../../etc/passwd``) escaping the results directory.
+        """
+        safe_name = pathlib.Path(filename).name
+        if not safe_name or safe_name in (".", ".."):
+            raise ValueError(f"Invalid result filename: {filename!r}")
+        result_path = self.path / "results" / safe_name
         with open(result_path, "w") as f:
             f.write(content)
-        self._log(f"Result saved: {filename}")
+        self._log(f"Result saved: {safe_name}")
         return result_path
 
     def save_advice(self, title: str, content: str) -> pathlib.Path:
@@ -174,8 +232,21 @@ class Project:
 
 
 @dataclass
+class DisplayCalibration:
+    """Scale factors between xdotool coordinate space and screenshot pixels."""
+
+    xdotool_w: int
+    xdotool_h: int
+    screenshot_w: int
+    screenshot_h: int
+    scale_x: float  # xdotool_w / screenshot_w
+    scale_y: float  # xdotool_h / screenshot_h
+
+
+@dataclass
 class AppContext:
     ssh: asyncssh.SSHClientConnection
+    calibration: DisplayCalibration
     project: Project | None = None
 
 
@@ -215,14 +286,112 @@ async def run_vm_cmd(
     return (result.stdout or "").strip()
 
 
+async def _run_type(
+    ssh: asyncssh.SSHClientConnection,
+    display_q: str,
+    text: str,
+) -> None:
+    """Type *text* into the VM, one line at a time.
+
+    Newlines are sent as explicit ``Return`` key presses rather than typed as a
+    literal LF. In nested / rich-editor contexts (Citrix -> Windows -> Outlook) a
+    literal LF from ``xdotool type`` is delivered as a stray control-character
+    glyph instead of a paragraph break (README Known Issues #2). Splitting on
+    newlines and pressing Return is robust in both terminals and rich editors.
+
+    Each line's text still goes to xdotool via stdin (--file -), so it never
+    touches the shell.
+    """
+    # Normalise CRLF / CR so we only split on \n.
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    segments = normalized.split("\n")
+    type_cmd = _type_cmd(display_q)
+    return_cmd = f"DISPLAY={display_q} xdotool key Return"
+    for idx, segment in enumerate(segments):
+        if segment:
+            await ssh.run(type_cmd, input=segment, check=True)
+        if idx < len(segments) - 1:
+            await run_vm_cmd(ssh, return_cmd)
+
+
+async def _calibrate_display(
+    ssh: asyncssh.SSHClientConnection,
+) -> DisplayCalibration:
+    """Probe the VM display to compute scale factors.
+
+    Compares xdotool's coordinate space with the actual screenshot pixel
+    dimensions.  Falls back to 1:1 scale on any failure (non-fatal).
+    """
+    fallback = DisplayCalibration(0, 0, 0, 0, 1.0, 1.0)
+    display = shlex.quote(VM_DISPLAY)
+    try:
+        # 1) xdotool coordinate space
+        geo = await run_vm_cmd(ssh, f"DISPLAY={display} xdotool getdisplaygeometry")
+        xw, xh = (int(v) for v in geo.split())
+
+        # 2) Take a calibration screenshot and read its pixel dimensions
+        cal_path = "/tmp/mcp-calibrate.png"
+        await run_vm_cmd(
+            ssh,
+            f"DISPLAY={display} scrot {shlex.quote(cal_path)}",
+        )
+        file_info = await run_vm_cmd(ssh, f"file {shlex.quote(cal_path)}")
+        await run_vm_cmd(ssh, f"rm -f {shlex.quote(cal_path)}")
+
+        # Parse "PNG image data, 1920 x 1080, ..." from `file` output
+        m = re.search(r"(\d+)\s*x\s*(\d+)", file_info)
+        if not m:
+            print(
+                "[calibration] Could not parse screenshot "
+                f"dimensions from: {file_info}",
+                file=sys.stderr,
+            )
+            return fallback
+        sw, sh = int(m.group(1)), int(m.group(2))
+
+        scale_x = xw / sw
+        scale_y = xh / sh
+        cal = DisplayCalibration(xw, xh, sw, sh, scale_x, scale_y)
+
+        if scale_x == 1.0 and scale_y == 1.0:
+            print("[calibration] 1:1, no scaling needed", file=sys.stderr)
+        else:
+            print(
+                f"[calibration] xdotool={xw}x{xh}, screenshot={sw}x{sh}, "
+                f"scale=({scale_x:.4f}, {scale_y:.4f})",
+                file=sys.stderr,
+            )
+        return cal
+
+    except Exception as exc:
+        print(
+            f"[calibration] Failed ({exc}), falling back to 1:1 scale",
+            file=sys.stderr,
+        )
+        return fallback
+
+
+def _scale_input(cal: DisplayCalibration, x: int, y: int) -> tuple[int, int]:
+    """Convert screenshot-space coordinates to xdotool-space (multiply)."""
+    return round(x * cal.scale_x), round(y * cal.scale_y)
+
+
+def _scale_output(cal: DisplayCalibration, x: int, y: int) -> tuple[int, int]:
+    """Convert xdotool-space coordinates to screenshot-space (divide)."""
+    if cal.scale_x == 0 or cal.scale_y == 0:
+        return x, y
+    return round(x / cal.scale_x), round(y / cal.scale_y)
+
+
 # ---------- MCP server setup ----------
 
 
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     ssh = await connect_ssh()
+    calibration = await _calibrate_display(ssh)
     try:
-        yield AppContext(ssh=ssh)
+        yield AppContext(ssh=ssh, calibration=calibration)
     finally:
         ssh.close()
         await ssh.wait_closed()
@@ -252,15 +421,13 @@ async def move_mouse(
     especially in nested environments (Citrix, VMs). Mouse movements work but
     keyboard navigation is more consistent.
     """
-    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    ssh = app_ctx.ssh
+    cal = app_ctx.calibration
     x, y = int(x), int(y)
+    sx, sy = _scale_input(cal, x, y)
     display = shlex.quote(VM_DISPLAY)
-    if mode == "absolute":
-        cmd = f"DISPLAY={display} xdotool mousemove --sync {x} {y}"
-    elif mode == "relative":
-        cmd = f"DISPLAY={display} xdotool mousemove_relative --sync {x} {y}"
-    else:
-        raise ValueError("mode must be 'absolute' or 'relative'")
+    cmd = _move_cmd(display, sx, sy, mode)
 
     await run_vm_cmd(ssh, cmd)
     result = f"Mouse moved to ({x}, {y}) [{mode}]"
@@ -370,18 +537,27 @@ async def get_active_window_info(
     - client_x, client_y: top-left of the content area in screen coords
       (computed as x + frame_left, y + frame_top)
     """
-    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    ssh = app_ctx.ssh
+    cal = app_ctx.calibration
     info = await _get_active_window_geometry(ssh)
     _log_tool_call(ctx, "get_active_window_info", {}, info["name"])
+
+    # Convert xdotool-space coordinates to screenshot-space for the caller
+    pos_x, pos_y = _scale_output(cal, info["x"], info["y"])
+    w, h = _scale_output(cal, info["width"], info["height"])
+    fl, fr = _scale_output(cal, info["frame_left"], info["frame_right"])
+    ft, fb = _scale_output(cal, info["frame_top"], info["frame_bottom"])
+    cx, cy = _scale_output(cal, info["client_x"], info["client_y"])
 
     lines = [
         f"Window ID: {info['window_id']}",
         f"Name: {info['name']}",
-        f"Position: ({info['x']}, {info['y']})",
-        f"Size: {info['width']}x{info['height']}",
-        f"Frame extents: left={info['frame_left']}, right={info['frame_right']}, "
-        f"top={info['frame_top']}, bottom={info['frame_bottom']}",
-        f"Client area origin: ({info['client_x']}, {info['client_y']})",
+        f"Position: ({pos_x}, {pos_y})",
+        f"Size: {w}x{h}",
+        f"Frame extents: left={fl}, right={fr}, "
+        f"top={ft}, bottom={fb}",
+        f"Client area origin: ({cx}, {cy})",
     ]
     return "\n".join(lines)
 
@@ -409,21 +585,21 @@ async def click_in_window(
         button: left/right/middle
         count: Number of clicks (1 for single, 2 for double)
     """
-    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
-    button_map = {"left": 1, "middle": 2, "right": 3}
-    if button not in button_map:
-        raise ValueError("button must be left/middle/right")
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    ssh = app_ctx.ssh
+    cal = app_ctx.calibration
 
     x, y, count = int(x), int(y), int(count)
+    sx, sy = _scale_input(cal, x, y)
 
     info = await _get_active_window_geometry(ssh)
-    screen_x = info["client_x"] + x
-    screen_y = info["client_y"] + y
+    screen_x = info["client_x"] + sx
+    screen_y = info["client_y"] + sy
 
     display = shlex.quote(VM_DISPLAY)
     cmd = (
-        f"DISPLAY={display} xdotool mousemove --sync {screen_x} {screen_y} && "
-        f"DISPLAY={display} xdotool click --repeat {count} {button_map[button]}"
+        f"{_move_cmd(display, screen_x, screen_y, 'absolute')} && "
+        f"{_click_cmd(display, button, count)}"
     )
     await run_vm_cmd(ssh, cmd)
 
@@ -459,13 +635,9 @@ async def click(
     take_screenshot() before typing after a click.
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
-    button_map = {"left": 1, "middle": 2, "right": 3}
-    if button not in button_map:
-        raise ValueError("button must be left/middle/right")
-
     count = int(count)
     display = shlex.quote(VM_DISPLAY)
-    cmd = f"DISPLAY={display} xdotool click --repeat {count} {button_map[button]}"
+    cmd = _click_cmd(display, button, count)
     await run_vm_cmd(ssh, cmd)
     result = f"Clicked {button} x{count}"
     _log_tool_call(ctx, "click", {"button": button, "count": count})
@@ -488,12 +660,13 @@ async def type_text(
     - No cursor visible = STOP and screenshot first
 
     The text is typed with 10ms delay between characters for reliability.
+    Newlines are sent as explicit Return key presses (not a literal LF), so
+    multi-line text produces real line breaks in both terminals and rich editors.
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
     # Text goes to stdin via --file -, never touches the shell
     display = shlex.quote(VM_DISPLAY)
-    cmd = f"DISPLAY={display} xdotool type --delay 10 --clearmodifiers --file -"
-    await ssh.run(cmd, input=text, check=True)
+    await _run_type(ssh, display, text)
     # Mask sensitive text in logs (only show length)
     log_text = text if len(text) <= 20 else f"{text[:10]}...({len(text)} chars)"
     _log_tool_call(ctx, "type_text", {"text": log_text})
@@ -519,13 +692,9 @@ async def press_keys(
     Always follow with wait() and take_screenshot() to verify the action completed.
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
-    for k in keys:
-        if not VALID_KEY_PATTERN.match(k):
-            raise ValueError(f"Invalid key name: {k!r}")
-    # xdotool uses 'ctrl+l', 'alt+F4', etc.
-    combo = "+".join(k.lower() for k in keys)
+    # xdotool uses 'ctrl+l', 'alt+F4', etc. (key names validated in _keys_cmd)
     display = shlex.quote(VM_DISPLAY)
-    cmd = f"DISPLAY={display} xdotool key {shlex.quote(combo)}"
+    cmd = _keys_cmd(display, keys)
     await run_vm_cmd(ssh, cmd)
     result = f"Pressed keys: {keys}"
     _log_tool_call(ctx, "press_keys", {"keys": keys})
@@ -593,7 +762,9 @@ async def run_actions(
     Returns:
         Summary of executed actions
     """
-    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    ssh = app_ctx.ssh
+    cal = app_ctx.calibration
     results = []
 
     for i, action_def in enumerate(actions):
@@ -604,41 +775,26 @@ async def run_actions(
 
             if action_type == "press_keys":
                 keys = action_def.get("keys", [])
-                for k in keys:
-                    if not VALID_KEY_PATTERN.match(k):
-                        raise ValueError(f"Invalid key name: {k!r}")
-                combo = "+".join(k.lower() for k in keys)
-                cmd = f"DISPLAY={display} xdotool key {shlex.quote(combo)}"
-                await run_vm_cmd(ssh, cmd)
+                await run_vm_cmd(ssh, _keys_cmd(display, keys))
                 results.append(f"{i + 1}. press_keys {keys}")
 
             elif action_type == "type_text":
                 text = action_def.get("text", "")
-                cmd = (
-                    f"DISPLAY={display} xdotool type"
-                    " --delay 10 --clearmodifiers --file -"
-                )
-                await ssh.run(cmd, input=text, check=True)
+                await _run_type(ssh, display, text)
                 results.append(f"{i + 1}. type_text ({len(text)} chars)")
 
             elif action_type == "click":
                 button = action_def.get("button", "left")
                 count = int(action_def.get("count", 1))
-                button_map = {"left": 1, "middle": 2, "right": 3}
-                btn_num = button_map.get(button, 1)
-                cmd = f"DISPLAY={display} xdotool click --repeat {count} {btn_num}"
-                await run_vm_cmd(ssh, cmd)
+                await run_vm_cmd(ssh, _click_cmd(display, button, count))
                 results.append(f"{i + 1}. click {button} x{count}")
 
             elif action_type == "move_mouse":
                 x = int(action_def.get("x", 0))
                 y = int(action_def.get("y", 0))
                 mode = action_def.get("mode", "absolute")
-                if mode == "absolute":
-                    cmd = f"DISPLAY={display} xdotool mousemove --sync {x} {y}"
-                else:
-                    cmd = f"DISPLAY={display} xdotool mousemove_relative --sync {x} {y}"
-                await run_vm_cmd(ssh, cmd)
+                sx, sy = _scale_input(cal, x, y)
+                await run_vm_cmd(ssh, _move_cmd(display, sx, sy, mode))
                 results.append(f"{i + 1}. move_mouse ({x}, {y}) [{mode}]")
 
             elif action_type == "wait":
@@ -892,15 +1048,61 @@ async def ssh_connection_info(
 
     _log_tool_call(ctx, "ssh_connection_info", {}, status)
 
+    cal = ctx.request_context.lifespan_context.calibration  # type: ignore[union-attr]
+    cal_line = (
+        f"Display Calibration: xdotool={cal.xdotool_w}x{cal.xdotool_h}, "
+        f"screenshot={cal.screenshot_w}x{cal.screenshot_h}, "
+        f"scale=({cal.scale_x:.4f}, {cal.scale_y:.4f})"
+    )
+
     info = f"""SSH Connection Information:
 Host: {VM_HOST}
 Port: {VM_PORT}
 User: {VM_USER}
 Display: {VM_DISPLAY}
 Status: {status}
-Identity File: {VM_IDENTITY or "Not specified (using password/agent)"}"""
+Identity File: {VM_IDENTITY or "Not specified (using password/agent)"}
+{cal_line}"""
 
     return info
+
+
+@mcp.tool()
+async def display_calibration_info(
+    recalibrate: bool = False,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Show current display calibration data (scale factors between xdotool
+    and screenshot coordinate spaces).
+
+    Set recalibrate=True to re-probe the display (useful after xrandr
+    resolution changes mid-session).
+
+    Returns:
+        Calibration details including xdotool geometry, screenshot
+        dimensions, and computed scale factors.
+    """
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+
+    if recalibrate:
+        app_ctx.calibration = await _calibrate_display(app_ctx.ssh)
+
+    cal = app_ctx.calibration
+    _log_tool_call(ctx, "display_calibration_info", {"recalibrate": recalibrate})
+
+    no_scale = cal.scale_x == 1.0 and cal.scale_y == 1.0
+    scaling = "1:1 (no scaling)" if no_scale else "active"
+    lines = [
+        f"Display Calibration ({scaling}):",
+        f"  xdotool geometry: {cal.xdotool_w}x{cal.xdotool_h}",
+        f"  Screenshot pixels: {cal.screenshot_w}x{cal.screenshot_h}",
+        f"  Scale X: {cal.scale_x:.4f}",
+        f"  Scale Y: {cal.scale_y:.4f}",
+    ]
+    if recalibrate:
+        lines.append("  (recalibrated)")
+    return "\n".join(lines)
 
 
 # ---------- Project Tools ----------
@@ -1006,7 +1208,8 @@ Description: {info["description"] or "(none)"}
 Folders created:
 - screenshots/
 - logs/
-- results/"""
+- results/
+- advice/"""
 
 
 @mcp.tool()
@@ -1299,6 +1502,9 @@ async def take_screenshot(
     async with ssh.start_sftp_client() as sftp:
         await sftp.get(remote_path, str(local_path))
 
+    # Remove the remote temp file so screenshots don't accumulate in /tmp.
+    await run_vm_cmd(ssh, f"rm -f {shlex.quote(remote_path)}")
+
     project._log(f"Screenshot captured: {sid}")
     resource_uri = f"vm://screenshot/{sid}"
     return f"Screenshot captured: {local_path}\nResource URI: {resource_uri}"
@@ -1311,6 +1517,12 @@ async def get_screenshot(sid: str) -> bytes:
     Return a screenshot by ID as binary data.
     Searches in all project folders.
     """
+    # Screenshot IDs are generated as a UTC timestamp ("%Y%m%d-%H%M%S-%f"),
+    # i.e. only digits and dashes. Reject anything else so a crafted sid
+    # (e.g. "../../etc/passwd") cannot escape the screenshots directory.
+    if not re.fullmatch(r"[0-9-]+", sid):
+        raise FileNotFoundError(f"No screenshot found for id {sid}")
+
     # Search in all projects for this screenshot
     for project_dir in PROJECTS_DIR.iterdir():
         if project_dir.is_dir():

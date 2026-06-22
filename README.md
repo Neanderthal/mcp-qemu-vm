@@ -18,6 +18,7 @@ A Model Context Protocol (MCP) server for controlling QEMU virtual machines via 
 - [Typical Workflow](#typical-workflow)
 - [Best Practices for LLM Automation](#best-practices-for-llm-automation)
 - [Architecture](#architecture)
+- [Known Issues & Limitations](#known-issues--limitations)
 - [Troubleshooting](#troubleshooting)
 
 ## Features
@@ -239,6 +240,7 @@ Set environment variables or create a `.env` file:
 | `VM_DISPLAY` | `:0` | X11 display |
 | `VM_IDENTITY` | (empty) | SSH private key path (optional) |
 | `VM_DESKTOP_USER` | (empty) | Desktop session owner, if different from `VM_USER` |
+| `VM_LOCALE` | `C.UTF-8` | UTF-8 locale forced for `xdotool type` (non-ASCII input) |
 | `VM_KNOWN_HOSTS` | (none) | SSH known_hosts file path (optional) |
 | `VM_CONNECT_TIMEOUT` | `10` | SSH connection timeout in seconds |
 
@@ -494,6 +496,79 @@ mcp-qemu-vm/
 └── README.md
 ```
 
+## Known Issues & Limitations
+
+Issues confirmed in real nested-environment use (host → Citrix → Windows → Outlook).
+Each lists the symptom, the root cause, and the current workaround.
+
+**#1 and #2 are fixed in `server.py`.** #3–#6 are inherent limitations of the nested
+environment (Citrix/RDP session policy) or the architecture (SSH lands on the first VM
+layer only) — they can't be fixed in this server, so the workarounds remain the
+recommended approach.
+
+### 1. `type_text` fails on Cyrillic / non-ASCII text — FIXED
+
+- **Symptom:** `type_text` (and any `xdotool type` with non-ASCII) errors out with
+  exit status 1. Direct run reveals: `Invalid multi-byte sequence encountered /
+  xdo_enter_text_window reported an error`. ASCII text types fine.
+- **Root cause:** `xdotool type` decodes multi-byte input using the current locale,
+  but the `vmrobot` / desktop-user SSH environment has **no UTF-8 locale**
+  (`LANG` empty, keyboard layout bare `us`). Without a UTF-8 `LC_CTYPE`, multi-byte
+  UTF-8 (Cyrillic, etc.) cannot be decoded.
+- **Fix (applied):** `type_text` and the `run_actions` type step now prefix the
+  xdotool invocation with `LC_ALL=$VM_LOCALE` (default `C.UTF-8`), so non-ASCII text
+  works out of the box. Override with the `VM_LOCALE` env var if the VM lacks
+  `C.UTF-8` (e.g. set `VM_LOCALE=ru_RU.utf8`; check available locales with
+  `locale -a`).
+
+### 2. Embedded newlines in typed text become literal glyphs, not Enter — FIXED
+
+- **Symptom:** Typing multi-line text (e.g. `xdotool type` with `\n`, or
+  `type --file -`) into a rich editor like Outlook produces one **run-on paragraph**
+  with stray box/control-character glyphs where the line breaks should be — paragraph
+  breaks are lost.
+- **Root cause:** In this nested Citrix → Windows path, the `\n` (LF) is delivered as a
+  literal control character to the editor instead of being interpreted as a Return
+  keypress.
+- **Fix (applied):** `type_text` (and the `run_actions` type step) now split text on
+  newlines, type each line via stdin, and send line breaks as explicit `Return` key
+  presses instead of a literal LF. `\r\n` and `\r` are normalised first. This works in
+  both terminals and rich editors — no caller-side splitting needed.
+
+### 3. Clipboard redirection may be disabled in the guest session
+
+- **Symptom:** Setting the host/X clipboard (`xclip -selection clipboard`) and pasting
+  with `Ctrl+V` does **not** transfer text into the Windows/Citrix layer.
+- **Root cause:** Clipboard redirection is turned off in the Citrix/RDP session policy,
+  so the inner session has its own isolated clipboard.
+- **Workaround:** do not rely on copy/paste to inject text across the nesting boundary;
+  fall back to typing (see issues #1 and #2).
+
+### 4. Focus is silently stolen after long operations
+
+- **Symptom:** A long type/automation sequence succeeds, but subsequent keystrokes
+  (e.g. `BackSpace` to correct text) have **no effect** — verified by a zero pixel-diff
+  between before/after screenshots.
+- **Root cause:** A desktop/mail notification toast (e.g. new-mail popup) grabs focus
+  partway through, so later keys go to the wrong window.
+- **Workaround:** re-assert focus by clicking the target window/field *immediately*
+  before each keyboard burst, and **verify** the result with a screenshot (crop the
+  region and diff) rather than trusting the tool's exit code. Keep keyboard bursts
+  short so a focus steal corrupts less.
+
+### 5. Mouse clicks are unreliable for window/focus switching
+
+See [Best Practices §2](#best-practices-for-llm-automation). In nested environments a
+click often raises a *different* background window than intended; there is no reliable
+`Alt+Tab` (it leaks to the host WM). Prefer the in-app taskbar / window controls and
+verify every switch with a screenshot.
+
+### 6. `ssh_execute` only reaches the first VM layer
+
+`ssh_execute` lands on the host/first VM only. Commands do **not** reach inner Citrix /
+Windows layers — use UI automation (`type_text`, `press_keys`, `run_actions`) for those.
+See [Best Practices §5](#best-practices-for-llm-automation).
+
 ## Troubleshooting
 
 ### Cannot connect to VM
@@ -525,6 +600,9 @@ mcp-qemu-vm/
 - Verify `xdotool` is installed on VM: `which xdotool`
 - Check X11 display: `echo $DISPLAY` (should be `:0`)
 - Test manually: `DISPLAY=:0 xdotool getmouselocation`
+- Non-ASCII text failing with exit 1 / "Invalid multi-byte sequence"? Missing UTF-8
+  locale — see [Known Issues #1](#known-issues--limitations).
+- Line breaks not working / run-on text? See [Known Issues #2](#known-issues--limitations).
 
 ### Screenshots failing / X11 Authorization Error
 

@@ -18,7 +18,7 @@ Env vars (or `.env`): `VM_HOST`, `VM_USER`, `VM_PORT`, `VM_DISPLAY`, `VM_IDENTIT
 
 ## Architecture
 
-`server.py`: `Project` class (folder structure), `AppContext` (SSH + project state), `lifespan()` (connection lifecycle), `run_vm_cmd()` (shell helper). Tools: project management, UI automation (xdotool), screenshots (scrot), SSH ops, advice system. All outputs go to `data/projects/`.
+`server.py`: `Project` class (folder structure), `AppContext` (SSH + project state + `DisplayCalibration`), `lifespan()` (connection lifecycle + display calibration), `run_vm_cmd()` (shell helper). Tools: project management, UI automation (xdotool), screenshots (scrot), SSH ops, advice system. `DisplayCalibration` auto-detects HiDPI/scaling mismatches at startup; coordinate tools scale transparently. All outputs go to `data/projects/`.
 
 ## Rules
 
