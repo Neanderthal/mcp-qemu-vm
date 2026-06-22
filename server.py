@@ -301,10 +301,26 @@ class DisplayCalibration:
 
 
 @dataclass
+class ZoomRegion:
+    """A magnified crop of the screen and how to map its pixels back.
+
+    A point (zx, zy) in the zoomed image maps to the full-screen
+    (screenshot-space) point (left + zx/scale, top + zy/scale).
+    """
+
+    left: int  # crop origin x in screenshot-space
+    top: int  # crop origin y in screenshot-space
+    crop_w: int  # crop width in screenshot-space
+    crop_h: int  # crop height in screenshot-space
+    scale: float  # magnification factor
+
+
+@dataclass
 class AppContext:
     ssh: asyncssh.SSHClientConnection
     calibration: DisplayCalibration
     project: Project | None = None
+    last_zoom: ZoomRegion | None = None  # set by zoom(), used by click_zoomed()
 
 
 async def connect_ssh() -> asyncssh.SSHClientConnection:
@@ -521,6 +537,70 @@ def _match_text_boxes(
         ):
             deduped.append(m)
     return deduped
+
+
+# ---------- Zoom (crop + magnify, with coordinate mapping) ----------
+# Tier 4 of the cascade: magnify a region so small/low-contrast detail is legible,
+# and remember the crop so a point picked in the zoomed image maps back to the
+# exact full-screen pixel (no coordinate math for the caller).
+
+
+def _zoom_region(
+    img_w: int, img_h: int, x: int, y: int, w: int, h: int, scale: float
+) -> ZoomRegion:
+    """Compute a crop of size ~(w, h) centered on (x, y), clamped to the image.
+
+    Pure/synchronous — unit-testable without PIL or a VM.
+    """
+    w = max(1, min(int(w), img_w))
+    h = max(1, min(int(h), img_h))
+    left = max(0, min(int(x) - w // 2, img_w - w))
+    top = max(0, min(int(y) - h // 2, img_h - h))
+    return ZoomRegion(left=left, top=top, crop_w=w, crop_h=h, scale=float(scale))
+
+
+def _zoom_map(z: ZoomRegion, zx: int, zy: int) -> tuple[int, int]:
+    """Map a point in the zoomed image back to full-screen (screenshot-space).
+
+    Clamped to the crop bounds. Inverse of the crop+upscale transform.
+    """
+    fx = z.left + round(int(zx) / z.scale)
+    fy = z.top + round(int(zy) / z.scale)
+    fx = max(z.left, min(fx, z.left + z.crop_w - 1))
+    fy = max(z.top, min(fy, z.top + z.crop_h - 1))
+    return fx, fy
+
+
+def _crop_zoom(
+    png_bytes: bytes, x: int, y: int, w: int, h: int, scale: float
+) -> tuple[bytes, ZoomRegion]:
+    """Crop a region around (x, y) from a full-screen PNG and magnify it.
+
+    Returns (zoomed_png_bytes, ZoomRegion). PIL is lazy-imported so the server
+    still runs without it. CPU-bound — call via asyncio.to_thread.
+    """
+    try:
+        import io
+
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover - depends on host install
+        raise RuntimeError("zoom needs Pillow on the host") from exc
+
+    img = Image.open(io.BytesIO(png_bytes))
+    region = _zoom_region(img.width, img.height, x, y, w, h, scale)
+    box = (
+        region.left,
+        region.top,
+        region.left + region.crop_w,
+        region.top + region.crop_h,
+    )
+    zoom_w = int(region.crop_w * region.scale)
+    zoom_h = int(region.crop_h * region.scale)
+    lanczos = getattr(Image, "Resampling", Image).LANCZOS  # Pillow >=9.1 moved it
+    zimg = img.crop(box).resize((zoom_w, zoom_h), lanczos)
+    buf = io.BytesIO()
+    zimg.save(buf, format="PNG")
+    return buf.getvalue(), region
 
 
 async def _calibrate_display(
@@ -961,6 +1041,95 @@ async def click_text(
     extra = f" (+{len(matches) - 1} other match(es))" if len(matches) > 1 else ""
     result = f"Clicked {m['text']!r} at ({m['cx']}, {m['cy']}){extra}"
     _log_tool_call(ctx, "click_text", {"query": query, "index": index}, result)
+    return result
+
+
+@mcp.tool()
+async def zoom(
+    x: int,
+    y: int,
+    width: int = 400,
+    height: int = 300,
+    scale: float = 3.0,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Magnify a region of the screen so small/low-contrast detail is legible.
+
+    Captures the screen, crops a `width`×`height` box centered on (x, y) — in
+    screenshot-space coordinates, clamped to the screen — and upscales it by
+    `scale`. Saves the result as a screenshot resource you can view, and
+    remembers the crop so click_zoomed(zx, zy) maps points in the zoomed image
+    back to exact full-screen pixels — no coordinate math needed.
+
+    Use this to read a tiny label/icon you can't resolve in the full screenshot,
+    then click_zoomed() the spot you want. Requires an active project.
+
+    Args:
+        x, y: Center of the region to magnify (screenshot-space)
+        width, height: Crop size before magnification (default 400×300)
+        scale: Magnification factor (default 3×)
+
+    Returns:
+        The zoomed image resource URI plus the crop mapping.
+    """
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    project = _get_project(ctx)  # type: ignore[arg-type]
+
+    png = await _grab_png(app_ctx.ssh)
+    zbytes, region = await asyncio.to_thread(
+        _crop_zoom, png, x, y, width, height, scale
+    )
+    app_ctx.last_zoom = region
+
+    sid = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S-%f")
+    project.screenshot_path(sid).write_bytes(zbytes)
+    project._log(f"Zoom captured: {sid} ({region.left},{region.top} x{region.scale})")
+
+    zoom_w = int(region.crop_w * region.scale)
+    zoom_h = int(region.crop_h * region.scale)
+    _log_tool_call(ctx, "zoom", {"x": x, "y": y, "scale": scale})
+    return (
+        f"Zoomed: origin=({region.left}, {region.top}) "
+        f"crop={region.crop_w}x{region.crop_h} scale={region.scale} "
+        f"-> image {zoom_w}x{zoom_h}\n"
+        f"Resource URI: vm://screenshot/{sid}\n"
+        f"Click a point in this image with click_zoomed(zx, zy)."
+    )
+
+
+@mcp.tool()
+async def click_zoomed(
+    zx: int,
+    zy: int,
+    button: str = "left",
+    count: int = 1,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Click a point given in the most recent zoom()'s image coordinates.
+
+    The server maps (zx, zy) from the zoomed image back to the exact full-screen
+    pixel and clicks there. Call zoom() first; coordinates are read from the
+    magnified image it returned.
+
+    Args:
+        zx, zy: Point within the last zoomed image (its pixel coordinates)
+        button: left/right/middle
+        count: Click count (2 = double-click)
+    """
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    region = app_ctx.last_zoom
+    if region is None:
+        return "Error: no prior zoom(); call zoom() first."
+
+    fx, fy = _zoom_map(region, int(zx), int(zy))
+    sx, sy = _scale_input(app_ctx.calibration, fx, fy)
+    display = shlex.quote(VM_DISPLAY)
+    await run_vm_cmd(app_ctx.ssh, _click_at_cmd(display, sx, sy, button, int(count)))
+
+    result = f"Clicked zoomed ({int(zx)}, {int(zy)}) -> screen ({fx}, {fy})"
+    _log_tool_call(ctx, "click_zoomed", {"zx": zx, "zy": zy}, result)
     return result
 
 
