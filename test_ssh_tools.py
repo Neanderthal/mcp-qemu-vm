@@ -142,6 +142,37 @@ def test_key_event_cmd_validates_keys():
         _key_event_cmd(DISPLAY_Q, ["a;b"], "keydown")
 
 
+@pytest.mark.parametrize(
+    "keys,expected",
+    [
+        # named keysyms must keep their case (lowercase is ignored by xdotool)
+        (["Page_Up"], "Page_Up"),
+        (["Page_Down"], "Page_Down"),
+        (["Prior"], "Prior"),
+        (["Next"], "Next"),
+        (["Home"], "Home"),
+        (["End"], "End"),
+        (["Return"], "Return"),
+        (["BackSpace"], "BackSpace"),
+        (["F4"], "F4"),
+        (["KP_Enter"], "KP_Enter"),
+        # single letters fold to lowercase so Ctrl+L means ctrl+l
+        (["Ctrl", "L"], "ctrl+l"),
+        (["Ctrl", "Shift", "P"], "ctrl+shift+p"),
+        # named keysym combined with a modifier keeps case (this is the PgDn bug)
+        (["Ctrl", "Home"], "ctrl+Home"),
+        (["Alt", "F4"], "alt+F4"),
+        (["Shift", "Page_Down"], "shift+Page_Down"),
+        # modifier aliases normalise to xdotool forms
+        (["Control", "a"], "ctrl+a"),
+        (["Win", "d"], "super+d"),
+        (["Meta", "Tab"], "super+Tab"),
+    ],
+)
+def test_key_event_cmd_preserves_named_keysym_case(keys, expected):
+    assert _key_event_cmd(DISPLAY_Q, keys).endswith(f"xdotool key {expected}")
+
+
 def test_click_cmd_maps_buttons():
     assert _click_cmd(DISPLAY_Q, "left", 1).endswith(" 1")
     assert _click_cmd(DISPLAY_Q, "middle", 1).endswith(" 2")
