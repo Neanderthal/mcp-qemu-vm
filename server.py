@@ -21,6 +21,10 @@ VM_PORT = int(os.getenv("VM_PORT", "22"))
 VM_DISPLAY = os.getenv("VM_DISPLAY", ":0")
 VM_IDENTITY = os.getenv("VM_IDENTITY", "")  # path to private key, optional
 VM_DESKTOP_USER = os.getenv("VM_DESKTOP_USER", "")  # if different from VM_USER
+# UTF-8 locale for `xdotool type`. The vmrobot/desktop SSH environment often has
+# no UTF-8 LC_CTYPE, so multi-byte input (Cyrillic, etc.) fails with "Invalid
+# multi-byte sequence". Forcing LC_ALL here makes type_text work for non-ASCII.
+VM_LOCALE = os.getenv("VM_LOCALE", "C.UTF-8")
 
 PROJECTS_DIR = pathlib.Path("data/projects")
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -28,6 +32,52 @@ PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 # Every legitimate xdotool key name (Return, BackSpace, Ctrl, F12, KP_Enter, space)
 # matches this pattern. Rejects shell metacharacters like ; $ ` |
 VALID_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
+
+# xdotool button numbers
+BUTTON_MAP = {"left": 1, "middle": 2, "right": 3}
+
+
+# ---------- xdotool command builders ----------
+# Shared by the standalone tools and the run_actions() batch loop so the two
+# never diverge. Each takes an already-shlex-quoted display string and returns
+# a shell command to run on the VM. Caller is responsible for execution.
+
+
+def _type_cmd(display_q: str) -> str:
+    """Build the `xdotool type` command. Text is piped via stdin (--file -),
+    so it never touches the shell. LC_ALL forces a UTF-8 locale so non-ASCII
+    (Cyrillic, etc.) decodes correctly."""
+    return (
+        f"LC_ALL={shlex.quote(VM_LOCALE)} DISPLAY={display_q} "
+        "xdotool type --delay 10 --clearmodifiers --file -"
+    )
+
+
+def _keys_cmd(display_q: str, keys: list[str]) -> str:
+    """Build an `xdotool key` command from a validated key list."""
+    for k in keys:
+        if not VALID_KEY_PATTERN.match(k):
+            raise ValueError(f"Invalid key name: {k!r}")
+    combo = "+".join(k.lower() for k in keys)
+    return f"DISPLAY={display_q} xdotool key {shlex.quote(combo)}"
+
+
+def _click_cmd(display_q: str, button: str, count: int) -> str:
+    """Build an `xdotool click` command. Count is clamped to >= 1 (xdotool
+    rejects --repeat 0)."""
+    if button not in BUTTON_MAP:
+        raise ValueError("button must be left/middle/right")
+    count = max(1, int(count))
+    return f"DISPLAY={display_q} xdotool click --repeat {count} {BUTTON_MAP[button]}"
+
+
+def _move_cmd(display_q: str, sx: int, sy: int, mode: str) -> str:
+    """Build an `xdotool mousemove` command (absolute or relative)."""
+    if mode == "absolute":
+        return f"DISPLAY={display_q} xdotool mousemove --sync {sx} {sy}"
+    if mode == "relative":
+        return f"DISPLAY={display_q} xdotool mousemove_relative --sync {sx} {sy}"
+    raise ValueError("mode must be 'absolute' or 'relative'")
 
 
 # ---------- Project Management ----------
@@ -342,12 +392,7 @@ async def move_mouse(
     x, y = int(x), int(y)
     sx, sy = _scale_input(cal, x, y)
     display = shlex.quote(VM_DISPLAY)
-    if mode == "absolute":
-        cmd = f"DISPLAY={display} xdotool mousemove --sync {sx} {sy}"
-    elif mode == "relative":
-        cmd = f"DISPLAY={display} xdotool mousemove_relative --sync {sx} {sy}"
-    else:
-        raise ValueError("mode must be 'absolute' or 'relative'")
+    cmd = _move_cmd(display, sx, sy, mode)
 
     await run_vm_cmd(ssh, cmd)
     result = f"Mouse moved to ({x}, {y}) [{mode}]"
@@ -508,9 +553,6 @@ async def click_in_window(
     app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
     ssh = app_ctx.ssh
     cal = app_ctx.calibration
-    button_map = {"left": 1, "middle": 2, "right": 3}
-    if button not in button_map:
-        raise ValueError("button must be left/middle/right")
 
     x, y, count = int(x), int(y), int(count)
     sx, sy = _scale_input(cal, x, y)
@@ -521,8 +563,8 @@ async def click_in_window(
 
     display = shlex.quote(VM_DISPLAY)
     cmd = (
-        f"DISPLAY={display} xdotool mousemove --sync {screen_x} {screen_y} && "
-        f"DISPLAY={display} xdotool click --repeat {count} {button_map[button]}"
+        f"{_move_cmd(display, screen_x, screen_y, 'absolute')} && "
+        f"{_click_cmd(display, button, count)}"
     )
     await run_vm_cmd(ssh, cmd)
 
@@ -558,13 +600,9 @@ async def click(
     take_screenshot() before typing after a click.
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
-    button_map = {"left": 1, "middle": 2, "right": 3}
-    if button not in button_map:
-        raise ValueError("button must be left/middle/right")
-
     count = int(count)
     display = shlex.quote(VM_DISPLAY)
-    cmd = f"DISPLAY={display} xdotool click --repeat {count} {button_map[button]}"
+    cmd = _click_cmd(display, button, count)
     await run_vm_cmd(ssh, cmd)
     result = f"Clicked {button} x{count}"
     _log_tool_call(ctx, "click", {"button": button, "count": count})
@@ -591,7 +629,7 @@ async def type_text(
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
     # Text goes to stdin via --file -, never touches the shell
     display = shlex.quote(VM_DISPLAY)
-    cmd = f"DISPLAY={display} xdotool type --delay 10 --clearmodifiers --file -"
+    cmd = _type_cmd(display)
     await ssh.run(cmd, input=text, check=True)
     # Mask sensitive text in logs (only show length)
     log_text = text if len(text) <= 20 else f"{text[:10]}...({len(text)} chars)"
@@ -618,13 +656,9 @@ async def press_keys(
     Always follow with wait() and take_screenshot() to verify the action completed.
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
-    for k in keys:
-        if not VALID_KEY_PATTERN.match(k):
-            raise ValueError(f"Invalid key name: {k!r}")
-    # xdotool uses 'ctrl+l', 'alt+F4', etc.
-    combo = "+".join(k.lower() for k in keys)
+    # xdotool uses 'ctrl+l', 'alt+F4', etc. (key names validated in _keys_cmd)
     display = shlex.quote(VM_DISPLAY)
-    cmd = f"DISPLAY={display} xdotool key {shlex.quote(combo)}"
+    cmd = _keys_cmd(display, keys)
     await run_vm_cmd(ssh, cmd)
     result = f"Pressed keys: {keys}"
     _log_tool_call(ctx, "press_keys", {"keys": keys})
@@ -705,30 +739,18 @@ async def run_actions(
 
             if action_type == "press_keys":
                 keys = action_def.get("keys", [])
-                for k in keys:
-                    if not VALID_KEY_PATTERN.match(k):
-                        raise ValueError(f"Invalid key name: {k!r}")
-                combo = "+".join(k.lower() for k in keys)
-                cmd = f"DISPLAY={display} xdotool key {shlex.quote(combo)}"
-                await run_vm_cmd(ssh, cmd)
+                await run_vm_cmd(ssh, _keys_cmd(display, keys))
                 results.append(f"{i + 1}. press_keys {keys}")
 
             elif action_type == "type_text":
                 text = action_def.get("text", "")
-                cmd = (
-                    f"DISPLAY={display} xdotool type"
-                    " --delay 10 --clearmodifiers --file -"
-                )
-                await ssh.run(cmd, input=text, check=True)
+                await ssh.run(_type_cmd(display), input=text, check=True)
                 results.append(f"{i + 1}. type_text ({len(text)} chars)")
 
             elif action_type == "click":
                 button = action_def.get("button", "left")
                 count = int(action_def.get("count", 1))
-                button_map = {"left": 1, "middle": 2, "right": 3}
-                btn_num = button_map.get(button, 1)
-                cmd = f"DISPLAY={display} xdotool click --repeat {count} {btn_num}"
-                await run_vm_cmd(ssh, cmd)
+                await run_vm_cmd(ssh, _click_cmd(display, button, count))
                 results.append(f"{i + 1}. click {button} x{count}")
 
             elif action_type == "move_mouse":
@@ -736,14 +758,7 @@ async def run_actions(
                 y = int(action_def.get("y", 0))
                 mode = action_def.get("mode", "absolute")
                 sx, sy = _scale_input(cal, x, y)
-                if mode == "absolute":
-                    cmd = f"DISPLAY={display} xdotool mousemove --sync {sx} {sy}"
-                else:
-                    cmd = (
-                        f"DISPLAY={display} xdotool"
-                        f" mousemove_relative --sync {sx} {sy}"
-                    )
-                await run_vm_cmd(ssh, cmd)
+                await run_vm_cmd(ssh, _move_cmd(display, sx, sy, mode))
                 results.append(f"{i + 1}. move_mouse ({x}, {y}) [{mode}]")
 
             elif action_type == "wait":
