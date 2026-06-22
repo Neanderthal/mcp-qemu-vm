@@ -3,6 +3,9 @@ name = "mcp-qemu-vm"
 version = "0.1.0"
 description = "MCP server for controlling QEMU virtual machines via SSH"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sergey Istomin", email = "sergey.istomin@gmail.com" }]
 dependencies = [
     "asyncssh",
     "mcp[cli]",
