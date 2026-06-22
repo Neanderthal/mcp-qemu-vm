@@ -352,9 +352,27 @@ find_text("File")             # lists all matches with coordinates
 click_text("OK", index=1)     # click the 2nd "OK" if several match
 ```
 
+### Zoom (magnify a region, then click it precisely)
+
+When detail is too small/low-contrast to resolve in the full screenshot, magnify
+a region and click within it. The server **keeps the crop mapping**, so a point
+you pick in the zoomed image maps back to the exact full-screen pixel — no
+coordinate math.
+
+| Tool | Description |
+|------|-------------|
+| `zoom(x, y, width, height, scale)` | Crop around (x, y) and magnify; returns a viewable image + mapping |
+| `click_zoomed(zx, zy, button, count)` | Click a point given in the last zoom's image coords |
+
+```python
+zoom(800, 600, width=400, height=300, scale=4)  # view a 4× magnified crop
+click_zoomed(610, 250)                           # click that spot → exact full-screen pixel
+```
+
 **Host requirements:** `tesseract` (the binary) plus `pillow` and `pytesseract`
 in the server's Python env. These are optional — the rest of the server runs
-without them; only `find_text`/`click_text` need them:
+without them; only the OCR (`find_text`/`click_text`) and zoom (`zoom`) tools
+need them (`zoom` needs only `pillow`):
 
 ```bash
 # Arch/Manjaro host

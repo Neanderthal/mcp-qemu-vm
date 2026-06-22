@@ -17,6 +17,7 @@ from server import (
     ACTION_HANDLERS,
     DisplayCalibration,
     Project,
+    ZoomRegion,
     _act_activate_window,
     _act_click,
     _act_drag,
@@ -35,6 +36,7 @@ from server import (
     _click_at_cmd,
     _click_cmd,
     _clipboard_set_cmd,
+    _crop_zoom,
     _drag_cmd,
     _key_event_cmd,
     _keys_cmd,
@@ -46,6 +48,8 @@ from server import (
     _scale_output,
     _scroll_cmd,
     _type_cmd,
+    _zoom_map,
+    _zoom_region,
     get_screenshot,
     run_actions,
 )
@@ -658,6 +662,62 @@ def test_match_ranks_exact_word_above_substring():
 
 def test_action_handlers_includes_click_text():
     assert "click_text" in ACTION_HANDLERS
+
+
+# ---------- zoom region + coordinate mapping ----------
+
+
+def test_zoom_region_centers_and_keeps_size():
+    z = _zoom_region(1000, 800, 500, 400, 200, 100, 3.0)
+    assert (z.left, z.top, z.crop_w, z.crop_h) == (400, 350, 200, 100)
+    assert z.scale == 3.0
+
+
+def test_zoom_region_clamps_to_edges():
+    # near top-left: origin clamps to 0
+    z = _zoom_region(1000, 800, 10, 10, 200, 100, 2.0)
+    assert (z.left, z.top) == (0, 0)
+    # near bottom-right: origin clamps so the crop stays inside
+    z = _zoom_region(1000, 800, 990, 790, 200, 100, 2.0)
+    assert (z.left, z.top) == (800, 700)
+
+
+def test_zoom_region_clamps_size_to_image():
+    z = _zoom_region(640, 480, 100, 100, 2000, 2000, 2.0)
+    assert (z.crop_w, z.crop_h) == (640, 480)
+
+
+def test_zoom_map_inverts_the_transform():
+    z = ZoomRegion(left=100, top=50, crop_w=200, crop_h=100, scale=4.0)
+    # point 40,80 in the zoomed image -> 100+10, 50+20
+    assert _zoom_map(z, 40, 80) == (110, 70)
+
+
+def test_zoom_map_clamps_out_of_range_points():
+    z = ZoomRegion(left=100, top=50, crop_w=200, crop_h=100, scale=4.0)
+    fx, fy = _zoom_map(z, 100000, 100000)
+    assert fx == 100 + 200 - 1 and fy == 50 + 100 - 1
+
+
+def test_zoom_map_roundtrips_a_screen_point():
+    z = ZoomRegion(left=100, top=50, crop_w=200, crop_h=100, scale=4.0)
+    screen_x, screen_y = 150, 90  # a point inside the crop
+    zx = (screen_x - z.left) * z.scale  # its location in the zoomed image
+    zy = (screen_y - z.top) * z.scale
+    assert _zoom_map(z, zx, zy) == (screen_x, screen_y)
+
+
+def test_crop_zoom_produces_magnified_png_and_region():
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (100, 80), (200, 200, 200)).save(buf, format="PNG")
+    zbytes, region = _crop_zoom(buf.getvalue(), 50, 40, 40, 20, 2.0)
+    assert (region.left, region.top, region.crop_w, region.crop_h) == (30, 30, 40, 20)
+    out = Image.open(io.BytesIO(zbytes))
+    assert out.size == (80, 40)  # 40*2 x 20*2
 
 
 async def check_connection() -> bool:
