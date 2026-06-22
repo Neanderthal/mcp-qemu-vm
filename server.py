@@ -864,6 +864,73 @@ async def key_up(
     return f"Released keys: {keys}"
 
 
+async def _activate_window(
+    ssh: asyncssh.SSHClientConnection,
+    *,
+    title: str | None = None,
+    window_id: int | None = None,
+) -> str:
+    """Activate (focus + raise) a window by title substring or window id.
+
+    Returns the activated window's id and name. Raises ValueError if neither
+    selector is given or no window matches the title. The title is treated as
+    an xdotool --name regex and is shlex-quoted, so it can't reach the shell.
+    """
+    display = shlex.quote(VM_DISPLAY)
+    if window_id is not None:
+        wid = str(int(window_id))
+    elif title:
+        # `|| true` so a no-match (xdotool exit 1) doesn't raise in run_vm_cmd
+        out = await run_vm_cmd(
+            ssh,
+            f"DISPLAY={display} xdotool search --name {shlex.quote(title)} || true",
+        )
+        matches = out.split()
+        if not matches:
+            raise ValueError(f"no window matching title {title!r}")
+        wid = matches[0]
+    else:
+        raise ValueError("provide either title or window_id")
+
+    name = await run_vm_cmd(
+        ssh,
+        f"DISPLAY={display} xdotool windowactivate --sync {wid} && "
+        f"DISPLAY={display} xdotool getwindowname {wid}",
+    )
+    return f"activated window {wid}: {name}"
+
+
+@mcp.tool()
+async def activate_window(
+    title: str | None = None,
+    window_id: int | None = None,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Focus and raise a window by title (substring/regex) or X11 window id.
+
+    More reliable than clicking to switch focus (see the click warning). Use
+    get_active_window_info() or take_screenshot() to read window titles first.
+
+    Args:
+        title: Match against window names (xdotool --name regex). First match wins.
+        window_id: Exact X11 window id (from get_active_window_info).
+
+    Returns:
+        The activated window's id and name, or an error if nothing matched.
+    """
+    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    try:
+        result = await _activate_window(ssh, title=title, window_id=window_id)
+    except ValueError as e:
+        _log_error(ctx, "activate_window", str(e))
+        return f"Error: {e}"
+    _log_tool_call(
+        ctx, "activate_window", {"title": title, "window_id": window_id}, result
+    )
+    return result
+
+
 @mcp.tool()
 async def wait(
     seconds: float,
@@ -957,6 +1024,12 @@ async def _act_key_up(app: "AppContext", display: str, a: dict) -> str:
     return f"key_up {keys}"
 
 
+async def _act_activate_window(app: "AppContext", display: str, a: dict) -> str:
+    return await _activate_window(
+        app.ssh, title=a.get("title"), window_id=a.get("window_id")
+    )
+
+
 async def _act_wait(app: "AppContext", display: str, a: dict) -> str:
     seconds = a.get("seconds", 0.5)
     await asyncio.sleep(seconds)
@@ -972,6 +1045,7 @@ ACTION_HANDLERS = {
     "drag": _act_drag,
     "key_down": _act_key_down,
     "key_up": _act_key_up,
+    "activate_window": _act_activate_window,
     "wait": _act_wait,
 }
 

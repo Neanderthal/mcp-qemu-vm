@@ -17,6 +17,7 @@ from server import (
     ACTION_HANDLERS,
     DisplayCalibration,
     Project,
+    _act_activate_window,
     _act_click,
     _act_drag,
     _act_key_down,
@@ -34,6 +35,7 @@ from server import (
     _move_cmd,
     _parse_frame_extents,
     _run_type,
+    _activate_window,
     _scale_input,
     _scale_output,
     _scroll_cmd,
@@ -46,20 +48,23 @@ DISPLAY_Q = "':0'"
 
 
 class FakeSSH:
-    """Records every ssh.run() invocation as (cmd, input)."""
+    """Records every ssh.run() invocation as (cmd, input).
 
-    def __init__(self):
+    *stdout* is returned for every command (default empty), enough for the
+    pure command-construction tests that don't depend on real output.
+    """
+
+    def __init__(self, stdout: str = ""):
         self.calls: list[tuple[str, str | None]] = []
+        self._stdout = stdout
 
     async def run(self, cmd, *, input=None, check=False):  # noqa: A002
         self.calls.append((cmd, input))
-
-        class _Result:
-            stdout = ""
-            stderr = ""
-            returncode = 0
-
-        return _Result()
+        return type(
+            "_Result",
+            (),
+            {"stdout": self._stdout, "stderr": "", "returncode": 0},
+        )()
 
 
 class FakeApp:
@@ -258,6 +263,7 @@ def test_action_handlers_registry_is_canonical_set():
         "drag",
         "key_down",
         "key_up",
+        "activate_window",
         "wait",
     }
 
@@ -342,6 +348,46 @@ def test_act_key_down_and_up():
     assert up == "key_up ['shift']"
     assert any("xdotool keydown shift" in c for c in _cmds(ssh))
     assert any("xdotool keyup shift" in c for c in _cmds(ssh))
+
+
+# ---------- activate_window ----------
+
+
+def test_activate_window_by_id_issues_windowactivate():
+    ssh = FakeSSH()
+    result = asyncio.run(_activate_window(ssh, window_id=42))
+    assert result.startswith("activated window 42:")
+    assert any("windowactivate --sync 42" in c for c in _cmds(ssh))
+    # window_id path must NOT run a search
+    assert all("xdotool search" not in c for c in _cmds(ssh))
+
+
+def test_activate_window_by_title_searches_then_activates():
+    ssh = FakeSSH(stdout="98765")  # search + getwindowname both return this
+    result = asyncio.run(_activate_window(ssh, title="Mousepad"))
+    assert "98765" in result
+    cmds = _cmds(ssh)
+    assert any("xdotool search --name" in c for c in cmds)
+    assert any("windowactivate --sync 98765" in c for c in cmds)
+
+
+def test_activate_window_no_match_raises():
+    ssh = FakeSSH(stdout="")  # search finds nothing
+    with pytest.raises(ValueError, match="no window matching"):
+        asyncio.run(_activate_window(ssh, title="Nonexistent"))
+
+
+def test_activate_window_requires_a_selector():
+    with pytest.raises(ValueError, match="provide either"):
+        asyncio.run(_activate_window(FakeSSH()))
+
+
+def test_act_activate_window_delegates():
+    ssh = FakeSSH()
+    result = asyncio.run(
+        _act_activate_window(FakeApp(ssh), DISPLAY_Q, {"window_id": 7})
+    )
+    assert result.startswith("activated window 7:")
 
 
 def test_act_wait_summary():
