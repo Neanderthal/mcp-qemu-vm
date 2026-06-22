@@ -1,2 +1,9 @@
 mcp[cli]
 asyncssh
+
+# Optional: enables the OCR object-location tools (find_text / click_text).
+# Also requires the `tesseract` binary on the host (e.g. pacman -S tesseract
+# tesseract-data-eng). The server runs fine without these; the OCR tools are
+# lazy-imported and only fail if called when unavailable.
+# pillow
+# pytesseract

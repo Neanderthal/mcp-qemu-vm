@@ -38,6 +38,7 @@ from server import (
     _drag_cmd,
     _key_event_cmd,
     _keys_cmd,
+    _match_text_boxes,
     _move_cmd,
     _parse_frame_extents,
     _run_type,
@@ -272,6 +273,7 @@ def test_action_handlers_registry_is_canonical_set():
         "screenshot",
         "set_clipboard",
         "paste",
+        "click_text",
         "wait",
     }
 
@@ -576,6 +578,74 @@ def test_get_screenshot_rejects_bad_sid(bad_sid):
 
 
 # ---------- live SSH smoke checks (manual, not collected by pytest) ----------
+
+
+# ---------- OCR text matching (_match_text_boxes) ----------
+
+
+def _w(text, left, top, width=40, height=20, conf=90, line=(0, 0, 0)):
+    """Build a synthetic OCR word box."""
+    return {
+        "text": text,
+        "left": left,
+        "top": top,
+        "width": width,
+        "height": height,
+        "conf": conf,
+        "line": line,
+    }
+
+
+def test_match_single_word_returns_center():
+    words = [_w("File", 10, 10), _w("Edit", 60, 10)]
+    matches = _match_text_boxes(words, "Edit")
+    assert len(matches) == 1
+    assert matches[0]["text"] == "Edit"
+    assert (matches[0]["cx"], matches[0]["cy"]) == (60 + 20, 10 + 10)
+
+
+def test_match_is_case_insensitive_and_substring():
+    matches = _match_text_boxes([_w("Submit", 100, 40, width=80)], "sub")
+    assert len(matches) == 1
+    assert matches[0]["text"] == "Submit"
+
+
+def test_match_multiword_unions_adjacent_boxes():
+    words = [_w("Save", 100, 50, width=50), _w("As", 160, 50, width=30, line=(0, 0, 0))]
+    matches = _match_text_boxes(words, "Save As")
+    assert len(matches) == 1
+    m = matches[0]
+    assert m["text"] == "Save As"
+    # union: left=100, right=190 -> width 90; center x = 145
+    assert m["left"] == 100 and m["width"] == 90
+    assert m["cx"] == 145
+
+
+def test_match_no_result_returns_empty():
+    assert _match_text_boxes([_w("File", 0, 0)], "Quit") == []
+
+
+def test_match_filters_low_confidence():
+    words = [_w("Login", 10, 10, conf=12)]
+    assert _match_text_boxes(words, "Login", min_conf=40) == []
+    assert len(_match_text_boxes(words, "Login", min_conf=10)) == 1
+
+
+def test_match_orders_results_top_to_bottom():
+    words = [
+        _w("OK", 500, 300, line=(0, 0, 5)),
+        _w("OK", 500, 50, line=(0, 0, 1)),
+    ]
+    matches = _match_text_boxes(words, "OK")
+    assert [m["top"] for m in matches] == [50, 300]
+
+
+def test_match_empty_query_returns_empty():
+    assert _match_text_boxes([_w("File", 0, 0)], "   ") == []
+
+
+def test_action_handlers_includes_click_text():
+    assert "click_text" in ACTION_HANDLERS
 
 
 async def check_connection() -> bool:

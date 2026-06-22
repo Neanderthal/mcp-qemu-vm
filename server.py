@@ -371,6 +371,148 @@ async def _run_type(
             await run_vm_cmd(ssh, return_cmd)
 
 
+# ---------- OCR text location ----------
+# Tier 1 of the object-location cascade: the LLM names a target by its visible
+# text; the host OCRs the full-res screenshot and returns exact pixel boxes in
+# screenshot-space, which feed straight into the existing click path. Detection
+# runs on the host (tesseract) against the downloaded PNG — the VM stays lean.
+
+
+async def _grab_png(ssh: asyncssh.SSHClientConnection) -> bytes:
+    """Capture the VM screen and return the PNG bytes (no project needed).
+
+    scrot writes to a temp file on the VM; we read it over SFTP and delete it.
+    """
+    sid = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S-%f")
+    remote_path = f"/tmp/mcp-ocr-{sid}.png"
+    display = shlex.quote(VM_DISPLAY)
+    await run_vm_cmd(ssh, f"DISPLAY={display} scrot {shlex.quote(remote_path)}")
+    try:
+        async with ssh.start_sftp_client() as sftp:
+            async with sftp.open(remote_path, "rb") as f:
+                data = await f.read()
+    finally:
+        await run_vm_cmd(ssh, f"rm -f {shlex.quote(remote_path)}")
+    return data
+
+
+def _ocr_words(png_bytes: bytes) -> list[dict]:
+    """Run tesseract on PNG bytes and return word boxes in screenshot-space.
+
+    Each word: {text, conf, left, top, width, height, line}. Pillow, pytesseract
+    and the tesseract binary must be installed on the host (lazy-imported so the
+    server still runs without them). This is CPU-bound — call via asyncio.to_thread.
+    """
+    try:
+        import io
+
+        import pytesseract
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover - depends on host install
+        raise RuntimeError(
+            "OCR needs Pillow + pytesseract + the tesseract binary on the host"
+        ) from exc
+
+    img = Image.open(io.BytesIO(png_bytes))
+    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    words: list[dict] = []
+    for i in range(len(data["text"])):
+        text = (data["text"][i] or "").strip()
+        if not text:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            conf = -1.0
+        words.append(
+            {
+                "text": text,
+                "conf": conf,
+                "left": int(data["left"][i]),
+                "top": int(data["top"][i]),
+                "width": int(data["width"][i]),
+                "height": int(data["height"][i]),
+                "line": (
+                    data["block_num"][i],
+                    data["par_num"][i],
+                    data["line_num"][i],
+                ),
+            }
+        )
+    return words
+
+
+def _union_box(boxes: list[dict]) -> tuple[int, int, int, int]:
+    """Bounding box (left, top, width, height) covering several word boxes."""
+    left = min(b["left"] for b in boxes)
+    top = min(b["top"] for b in boxes)
+    right = max(b["left"] + b["width"] for b in boxes)
+    bottom = max(b["top"] + b["height"] for b in boxes)
+    return left, top, right - left, bottom - top
+
+
+def _mk_text_match(span: list[dict]) -> dict:
+    """Build a match dict (union box + center) from a run of word boxes."""
+    left, top, width, height = _union_box(span)
+    return {
+        "text": " ".join(w["text"] for w in span),
+        "conf": min(w["conf"] for w in span),
+        "left": left,
+        "top": top,
+        "width": width,
+        "height": height,
+        "cx": left + width // 2,
+        "cy": top + height // 2,
+    }
+
+
+def _match_text_boxes(
+    words: list[dict], query: str, min_conf: float = 40.0
+) -> list[dict]:
+    """Find screen locations matching *query* (case-insensitive).
+
+    Query tokens are matched per word, anchored to word boundaries: a single-token
+    query matches any single word containing it (so "edit" hits "Edit", not the
+    "edit" inside "File Edit"); a multi-token query like "Save As" matches a window
+    of consecutive words where token k is contained in word k, and unions their
+    boxes. Returns match dicts with the union box plus center (cx, cy), in reading
+    order, de-duplicated. Pure/synchronous — unit-testable without OCR or a VM.
+    """
+    qt = query.lower().split()
+    if not qt:
+        return []
+
+    kept = [w for w in words if w["conf"] >= min_conf and w["text"].strip()]
+    lines: dict = {}
+    for w in kept:
+        lines.setdefault(w["line"], []).append(w)
+
+    matches: list[dict] = []
+    for line_words in lines.values():
+        line_words.sort(key=lambda w: w["left"])
+        texts = [w["text"].lower() for w in line_words]
+        n = len(line_words)
+        if len(qt) == 1:
+            matches += [
+                _mk_text_match(line_words[k : k + 1])
+                for k in range(n)
+                if qt[0] in texts[k]
+            ]
+        else:
+            for i in range(n - len(qt) + 1):
+                if all(qt[t] in texts[i + t] for t in range(len(qt))):
+                    matches.append(_mk_text_match(line_words[i : i + len(qt)]))
+
+    matches.sort(key=lambda m: (m["top"], m["left"]))
+    deduped: list[dict] = []
+    for m in matches:
+        if not any(
+            abs(m["cx"] - d["cx"]) < 5 and abs(m["cy"] - d["cy"]) < 5 for d in deduped
+        ):
+            deduped.append(m)
+    return deduped
+
+
 async def _calibrate_display(
     ssh: asyncssh.SSHClientConnection,
 ) -> DisplayCalibration:
@@ -714,6 +856,101 @@ async def click(
 
     await run_vm_cmd(ssh, cmd)
     _log_tool_call(ctx, "click", params)
+    return result
+
+
+def _format_matches(query: str, matches: list[dict]) -> str:
+    lines = [
+        f"  {i}. {m['text']!r} center=({m['cx']}, {m['cy']}) "
+        f"box=({m['left']},{m['top']},{m['width']}x{m['height']}) conf={m['conf']:.0f}"
+        for i, m in enumerate(matches)
+    ]
+    return f"Found {len(matches)} match(es) for {query!r}:\n" + "\n".join(lines)
+
+
+@mcp.tool()
+async def find_text(
+    query: str,
+    min_conf: float = 40.0,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Locate on-screen text by OCR — returns exact pixel coordinates, no guessing.
+
+    Captures the current screen, OCRs it on the host (tesseract), and returns
+    every match for *query* (case-insensitive substring; multi-word queries like
+    "Save As" are matched across adjacent words) with its center and box in
+    screenshot-space. Pair with click_text() to click one, or pass the center to
+    click(x, y).
+
+    Use this instead of eyeballing coordinates from a screenshot — it is exact.
+    Works on any visible text, including nested Citrix/web where accessibility
+    APIs can't reach. Does not find icons/unlabeled controls.
+
+    Args:
+        query: Visible text to find (e.g. "Submit", "File", "Save As")
+        min_conf: Minimum OCR confidence 0-100 (default 40)
+    """
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    png = await _grab_png(app_ctx.ssh)
+    words = await asyncio.to_thread(_ocr_words, png)
+    matches = _match_text_boxes(words, query, min_conf)
+    _log_tool_call(ctx, "find_text", {"query": query}, f"{len(matches)} matches")
+    if not matches:
+        return f"No text matching {query!r} found (OCR'd {len(words)} words)."
+    return _format_matches(query, matches)
+
+
+@mcp.tool()
+async def click_text(
+    query: str,
+    index: int = 0,
+    button: str = "left",
+    count: int = 1,
+    min_conf: float = 40.0,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Find on-screen text by OCR and click its center — precise, no coordinate math.
+
+    The reliable way to click a labeled button/menu/link: name the visible text
+    and the host resolves it to exact pixels (full-res screenshot-space → scaled →
+    clicked). Far more accurate than estimating coordinates from a screenshot.
+
+    If several places match, they are ordered top-to-bottom, left-to-right; use
+    `index` to pick one (call find_text() first to see them). Errors without
+    clicking if nothing matches.
+
+    Args:
+        query: Visible text to click (e.g. "OK", "File", "Sign in")
+        index: Which match to click when there are several (default 0 = first)
+        button: left/right/middle
+        count: Click count (2 = double-click)
+        min_conf: Minimum OCR confidence 0-100 (default 40)
+    """
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    ssh = app_ctx.ssh
+    png = await _grab_png(ssh)
+    words = await asyncio.to_thread(_ocr_words, png)
+    matches = _match_text_boxes(words, query, min_conf)
+
+    if not matches:
+        _log_error(ctx, "click_text", f"no match for {query!r}")
+        return f"No text matching {query!r} found; nothing clicked."
+    if index < 0 or index >= len(matches):
+        return (
+            f"index {index} out of range; {len(matches)} match(es) for {query!r}.\n"
+            + _format_matches(query, matches)
+        )
+
+    m = matches[index]
+    sx, sy = _scale_input(app_ctx.calibration, m["cx"], m["cy"])
+    display = shlex.quote(VM_DISPLAY)
+    await run_vm_cmd(ssh, _click_at_cmd(display, sx, sy, button, int(count)))
+
+    extra = f" (+{len(matches) - 1} other match(es))" if len(matches) > 1 else ""
+    result = f"Clicked {m['text']!r} at ({m['cx']}, {m['cy']}){extra}"
+    _log_tool_call(ctx, "click_text", {"query": query, "index": index}, result)
     return result
 
 
@@ -1107,6 +1344,25 @@ async def _act_paste(app: "AppContext", display: str, a: dict) -> str:
     return "paste" + (f" ({len(text)} chars)" if text is not None else "")
 
 
+async def _act_click_text(app: "AppContext", display: str, a: dict) -> str:
+    query = a.get("query", "")
+    index = int(a.get("index", 0))
+    png = await _grab_png(app.ssh)
+    words = await asyncio.to_thread(_ocr_words, png)
+    matches = _match_text_boxes(words, query, float(a.get("min_conf", 40)))
+    if not matches:
+        raise ValueError(f"no text matching {query!r}")
+    if index < 0 or index >= len(matches):
+        raise ValueError(f"index {index} out of range ({len(matches)} matches)")
+    m = matches[index]
+    sx, sy = _scale_input(app.calibration, m["cx"], m["cy"])
+    await run_vm_cmd(
+        app.ssh,
+        _click_at_cmd(display, sx, sy, a.get("button", "left"), int(a.get("count", 1))),
+    )
+    return f"click_text {query!r} -> ({m['cx']}, {m['cy']})"
+
+
 async def _act_wait(app: "AppContext", display: str, a: dict) -> str:
     seconds = a.get("seconds", 0.5)
     await asyncio.sleep(seconds)
@@ -1126,6 +1382,7 @@ ACTION_HANDLERS = {
     "screenshot": _act_screenshot,
     "set_clipboard": _act_set_clipboard,
     "paste": _act_paste,
+    "click_text": _act_click_text,
     "wait": _act_wait,
 }
 
@@ -1161,6 +1418,7 @@ async def run_actions(
     - {"action": "screenshot"}
     - {"action": "set_clipboard", "text": "hello"}
     - {"action": "paste", "text": "hello"}  # "text" optional
+    - {"action": "click_text", "query": "Submit"}  # OCR-locate + click
     - {"action": "wait", "seconds": 0.5}
 
     Example - focus a window, paste text, and capture the result:

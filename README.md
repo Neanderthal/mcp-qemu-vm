@@ -333,6 +333,35 @@ Projects organize all outputs (screenshots, logs, results, advice) into timestam
 ]
 ```
 
+### Object Location (OCR)
+
+Locate on-screen elements by their visible text — exact pixel coordinates, no
+coordinate guessing. The host OCRs the full-resolution screenshot (tesseract) and
+maps the match straight into the click path. Works on any visible text, including
+nested Citrix/web where accessibility APIs can't reach; does not find unlabeled
+icons.
+
+| Tool | Description |
+|------|-------------|
+| `find_text(query, min_conf)` | OCR the screen; return every match's center & box |
+| `click_text(query, index, button, count)` | Find text and click its center (precise) |
+
+```python
+click_text("Submit")          # finds "Submit" and clicks its exact center
+find_text("File")             # lists all matches with coordinates
+click_text("OK", index=1)     # click the 2nd "OK" if several match
+```
+
+**Host requirements:** `tesseract` (the binary) plus `pillow` and `pytesseract`
+in the server's Python env. These are optional — the rest of the server runs
+without them; only `find_text`/`click_text` need them:
+
+```bash
+# Arch/Manjaro host
+sudo pacman -S tesseract tesseract-data-eng
+uv pip install pillow pytesseract
+```
+
 ### SSH Operations
 
 | Tool | Description |
