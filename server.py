@@ -55,13 +55,25 @@ def _type_cmd(display_q: str) -> str:
     )
 
 
-def _keys_cmd(display_q: str, keys: list[str]) -> str:
-    """Build an `xdotool key` command from a validated key list."""
+def _key_event_cmd(display_q: str, keys: list[str], event: str = "key") -> str:
+    """Build an xdotool key-event command from a validated key list.
+
+    *event* is one of ``key`` (press+release), ``keydown`` (hold), or
+    ``keyup`` (release). Key names are validated against VALID_KEY_PATTERN and
+    the combo is shlex-quoted, so shell metacharacters can't slip through.
+    """
+    if event not in ("key", "keydown", "keyup"):
+        raise ValueError("event must be key/keydown/keyup")
     for k in keys:
         if not VALID_KEY_PATTERN.match(k):
             raise ValueError(f"Invalid key name: {k!r}")
     combo = "+".join(k.lower() for k in keys)
-    return f"DISPLAY={display_q} xdotool key {shlex.quote(combo)}"
+    return f"DISPLAY={display_q} xdotool {event} {shlex.quote(combo)}"
+
+
+def _keys_cmd(display_q: str, keys: list[str]) -> str:
+    """Build an `xdotool key` (press+release) command from a key list."""
+    return _key_event_cmd(display_q, keys, "key")
 
 
 def _click_cmd(display_q: str, button: str, count: int) -> str:
@@ -816,6 +828,43 @@ async def press_keys(
 
 
 @mcp.tool()
+async def key_down(
+    keys: list[str],
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Hold down a key or modifier combo WITHOUT releasing it.
+
+    Pair with key_up() to bracket other actions — e.g. Shift-click to extend a
+    selection, or hold Ctrl while clicking several items:
+        key_down(["shift"]) → click(...) → key_up(["shift"])
+
+    ⚠️ Always release with key_up() — a stuck modifier corrupts later input.
+    Prefer press_keys() for a normal one-shot combo.
+    """
+    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    display = shlex.quote(VM_DISPLAY)
+    await run_vm_cmd(ssh, _key_event_cmd(display, keys, "keydown"))
+    _log_tool_call(ctx, "key_down", {"keys": keys})
+    return f"Holding keys: {keys}"
+
+
+@mcp.tool()
+async def key_up(
+    keys: list[str],
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Release a key or modifier combo previously held with key_down().
+    """
+    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    display = shlex.quote(VM_DISPLAY)
+    await run_vm_cmd(ssh, _key_event_cmd(display, keys, "keyup"))
+    _log_tool_call(ctx, "key_up", {"keys": keys})
+    return f"Released keys: {keys}"
+
+
+@mcp.tool()
 async def wait(
     seconds: float,
     ctx: Context[ServerSession, AppContext] | None = None,
@@ -896,6 +945,18 @@ async def _act_drag(app: "AppContext", display: str, a: dict) -> str:
     return f"drag {button} ({x1}, {y1}) -> ({x2}, {y2})"
 
 
+async def _act_key_down(app: "AppContext", display: str, a: dict) -> str:
+    keys = a.get("keys", [])
+    await run_vm_cmd(app.ssh, _key_event_cmd(display, keys, "keydown"))
+    return f"key_down {keys}"
+
+
+async def _act_key_up(app: "AppContext", display: str, a: dict) -> str:
+    keys = a.get("keys", [])
+    await run_vm_cmd(app.ssh, _key_event_cmd(display, keys, "keyup"))
+    return f"key_up {keys}"
+
+
 async def _act_wait(app: "AppContext", display: str, a: dict) -> str:
     seconds = a.get("seconds", 0.5)
     await asyncio.sleep(seconds)
@@ -909,6 +970,8 @@ ACTION_HANDLERS = {
     "move_mouse": _act_move_mouse,
     "scroll": _act_scroll,
     "drag": _act_drag,
+    "key_down": _act_key_down,
+    "key_up": _act_key_up,
     "wait": _act_wait,
 }
 

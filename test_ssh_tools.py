@@ -19,6 +19,8 @@ from server import (
     Project,
     _act_click,
     _act_drag,
+    _act_key_down,
+    _act_key_up,
     _act_move_mouse,
     _act_press_keys,
     _act_scroll,
@@ -27,6 +29,7 @@ from server import (
     _click_at_cmd,
     _click_cmd,
     _drag_cmd,
+    _key_event_cmd,
     _keys_cmd,
     _move_cmd,
     _parse_frame_extents,
@@ -106,6 +109,22 @@ def test_keys_cmd_lowercases_and_joins():
 def test_keys_cmd_rejects_shell_metacharacters(bad):
     with pytest.raises(ValueError, match="Invalid key name"):
         _keys_cmd(DISPLAY_Q, [bad])
+
+
+@pytest.mark.parametrize("event", ["key", "keydown", "keyup"])
+def test_key_event_cmd_emits_each_event(event):
+    cmd = _key_event_cmd(DISPLAY_Q, ["Ctrl", "Shift"], event)
+    assert f"xdotool {event} ctrl+shift" in cmd
+
+
+def test_key_event_cmd_rejects_bad_event():
+    with pytest.raises(ValueError, match="key/keydown/keyup"):
+        _key_event_cmd(DISPLAY_Q, ["a"], "press")
+
+
+def test_key_event_cmd_validates_keys():
+    with pytest.raises(ValueError, match="Invalid key name"):
+        _key_event_cmd(DISPLAY_Q, ["a;b"], "keydown")
 
 
 def test_click_cmd_maps_buttons():
@@ -237,6 +256,8 @@ def test_action_handlers_registry_is_canonical_set():
         "move_mouse",
         "scroll",
         "drag",
+        "key_down",
+        "key_up",
         "wait",
     }
 
@@ -311,6 +332,16 @@ def test_act_press_keys_summary():
         _act_press_keys(FakeApp(ssh), DISPLAY_Q, {"keys": ["Ctrl", "a"]})
     )
     assert summary == "press_keys ['Ctrl', 'a']"
+
+
+def test_act_key_down_and_up():
+    ssh = FakeSSH()
+    down = asyncio.run(_act_key_down(FakeApp(ssh), DISPLAY_Q, {"keys": ["shift"]}))
+    up = asyncio.run(_act_key_up(FakeApp(ssh), DISPLAY_Q, {"keys": ["shift"]}))
+    assert down == "key_down ['shift']"
+    assert up == "key_up ['shift']"
+    assert any("xdotool keydown shift" in c for c in _cmds(ssh))
+    assert any("xdotool keyup shift" in c for c in _cmds(ssh))
 
 
 def test_act_wait_summary():
