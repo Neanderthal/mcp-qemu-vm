@@ -413,7 +413,11 @@ def _ocr_words(png_bytes: bytes) -> list[dict]:
             "OCR needs Pillow + pytesseract + the tesseract binary on the host"
         ) from exc
 
-    img = Image.open(io.BytesIO(png_bytes))
+    # Convert to grayscale first. tesseract binarises far better on a single
+    # luminance channel than on raw RGB — on themed desktops (e.g. green-on-dark
+    # terminal text) raw RGB can yield near-zero detections while grayscale
+    # recovers everything at high confidence.
+    img = Image.open(io.BytesIO(png_bytes)).convert("L")
     data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
     words: list[dict] = []
     for i in range(len(data["text"])):
@@ -503,7 +507,13 @@ def _match_text_boxes(
                 if all(qt[t] in texts[i + t] for t in range(len(qt))):
                     matches.append(_mk_text_match(line_words[i : i + len(qt)]))
 
-    matches.sort(key=lambda m: (m["top"], m["left"]))
+    # Rank exact whole-text matches ahead of partial/substring ones, then read
+    # order. So click_text("No") prefers a real "No" button over the "no" inside
+    # "normally"/"not".
+    q_norm = " ".join(qt)
+    matches.sort(
+        key=lambda m: (0 if m["text"].lower() == q_norm else 1, m["top"], m["left"])
+    )
     deduped: list[dict] = []
     for m in matches:
         if not any(

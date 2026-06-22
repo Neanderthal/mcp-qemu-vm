@@ -644,6 +644,18 @@ def test_match_empty_query_returns_empty():
     assert _match_text_boxes([_w("File", 0, 0)], "   ") == []
 
 
+def test_match_ranks_exact_word_above_substring():
+    # "No" should pick the real "No" button over the "no" inside "normally"/"not"
+    words = [
+        _w("normally", 100, 50, width=80, line=(0, 0, 0)),
+        _w("not", 100, 80, width=30, line=(0, 0, 1)),
+        _w("No", 100, 300, width=20, line=(0, 0, 9)),  # the button, lower down
+    ]
+    matches = _match_text_boxes(words, "No")
+    assert len(matches) == 3
+    assert matches[0]["text"] == "No"  # exact match ranked first despite being lowest
+
+
 def test_action_handlers_includes_click_text():
     assert "click_text" in ACTION_HANDLERS
 
