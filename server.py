@@ -35,6 +35,8 @@ VALID_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 
 # xdotool button numbers
 BUTTON_MAP = {"left": 1, "middle": 2, "right": 3}
+# Mouse-wheel scroll directions map to xdotool button numbers
+SCROLL_BUTTONS = {"up": 4, "down": 5, "left": 6, "right": 7}
 
 
 # ---------- xdotool command builders ----------
@@ -78,6 +80,40 @@ def _move_cmd(display_q: str, sx: int, sy: int, mode: str) -> str:
     if mode == "relative":
         return f"DISPLAY={display_q} xdotool mousemove_relative --sync {sx} {sy}"
     raise ValueError("mode must be 'absolute' or 'relative'")
+
+
+def _scroll_cmd(display_q: str, direction: str, amount: int) -> str:
+    """Build a mouse-wheel scroll command. Scrolling is N wheel 'clicks' on
+    xdotool buttons 4-7. Amount is clamped to >= 1."""
+    if direction not in SCROLL_BUTTONS:
+        raise ValueError("direction must be up/down/left/right")
+    amount = max(1, int(amount))
+    btn = SCROLL_BUTTONS[direction]
+    return f"DISPLAY={display_q} xdotool click --repeat {amount} {btn}"
+
+
+def _click_at_cmd(display_q: str, sx: int, sy: int, button: str, count: int) -> str:
+    """Build a move-then-click command (absolute screen coords already scaled).
+    Combining the move and click in one shell command removes the focus/race
+    window between a separate move_mouse + click."""
+    move = _move_cmd(display_q, sx, sy, "absolute")
+    click = _click_cmd(display_q, button, count)
+    return f"{move} && {click}"
+
+
+def _drag_cmd(
+    display_q: str, sx1: int, sy1: int, sx2: int, sy2: int, button: str
+) -> str:
+    """Build a press-move-release drag between two scaled screen points."""
+    if button not in BUTTON_MAP:
+        raise ValueError("button must be left/middle/right")
+    b = BUTTON_MAP[button]
+    return (
+        f"DISPLAY={display_q} xdotool mousemove --sync {sx1} {sy1} && "
+        f"DISPLAY={display_q} xdotool mousedown {b} && "
+        f"DISPLAY={display_q} xdotool mousemove --sync {sx2} {sy2} && "
+        f"DISPLAY={display_q} xdotool mouseup {b}"
+    )
 
 
 # ---------- Project Management ----------
@@ -620,27 +656,105 @@ async def click_in_window(
 async def click(
     button: str = "left",
     count: int = 1,
+    x: int | None = None,
+    y: int | None = None,
     ctx: Context[ServerSession, AppContext] | None = None,
 ) -> str:
     """
-    Click a mouse button.
+    Click a mouse button, optionally moving to an absolute point first.
 
     Args:
         button: left/right/middle
         count: Number of clicks (1 for single, 2 for double)
+        x, y: Optional absolute screen coordinates (screenshot-space). If both
+            are given, the cursor moves there and clicks in one operation,
+            avoiding the focus/race gap of a separate move_mouse + click. If
+            omitted, clicks at the current cursor position.
 
     ⚠️ WARNING: Mouse clicks do NOT reliably switch focus in nested environments
     (Citrix, remote desktop, high-latency connections). Use keyboard shortcuts
     like Ctrl+Shift+P to explicitly switch focus instead. Always verify with
     take_screenshot() before typing after a click.
     """
-    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    ssh = app_ctx.ssh
     count = int(count)
     display = shlex.quote(VM_DISPLAY)
-    cmd = _click_cmd(display, button, count)
+
+    if x is not None and y is not None:
+        sx, sy = _scale_input(app_ctx.calibration, int(x), int(y))
+        cmd = _click_at_cmd(display, sx, sy, button, count)
+        result = f"Clicked {button} x{count} at ({int(x)}, {int(y)})"
+        params = {"button": button, "count": count, "x": int(x), "y": int(y)}
+    else:
+        cmd = _click_cmd(display, button, count)
+        result = f"Clicked {button} x{count}"
+        params = {"button": button, "count": count}
+
     await run_vm_cmd(ssh, cmd)
-    result = f"Clicked {button} x{count}"
-    _log_tool_call(ctx, "click", {"button": button, "count": count})
+    _log_tool_call(ctx, "click", params)
+    return result
+
+
+@mcp.tool()
+async def scroll(
+    direction: str = "down",
+    amount: int = 3,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Scroll the mouse wheel at the current cursor position.
+
+    Move the cursor over the area you want to scroll first (move_mouse) — most
+    apps scroll the widget under the pointer.
+
+    Args:
+        direction: up / down / left / right
+        amount: Number of wheel steps (clamped to >= 1; ~3-5 ≈ one notch burst)
+    """
+    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    display = shlex.quote(VM_DISPLAY)
+    cmd = _scroll_cmd(display, direction, amount)
+    await run_vm_cmd(ssh, cmd)
+    result = f"Scrolled {direction} x{max(1, int(amount))}"
+    _log_tool_call(ctx, "scroll", {"direction": direction, "amount": amount})
+    return result
+
+
+@mcp.tool()
+async def drag(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    button: str = "left",
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Press at (x1, y1), drag to (x2, y2), and release — a click-and-drag.
+
+    Use for selecting text, moving sliders/scrollbars, dragging files/icons,
+    or repositioning windows. Coordinates are absolute screenshot-space points.
+
+    Args:
+        x1, y1: Start point (button pressed here)
+        x2, y2: End point (button released here)
+        button: left/right/middle (default left)
+    """
+    app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
+    ssh = app_ctx.ssh
+    cal = app_ctx.calibration
+    sx1, sy1 = _scale_input(cal, int(x1), int(y1))
+    sx2, sy2 = _scale_input(cal, int(x2), int(y2))
+    display = shlex.quote(VM_DISPLAY)
+    cmd = _drag_cmd(display, sx1, sy1, sx2, sy2, button)
+    await run_vm_cmd(ssh, cmd)
+    result = f"Dragged {button} from ({int(x1)}, {int(y1)}) to ({int(x2)}, {int(y2)})"
+    _log_tool_call(
+        ctx,
+        "drag",
+        {"x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2), "button": button},
+    )
     return result
 
 
@@ -747,6 +861,11 @@ async def _act_type_text(app: "AppContext", display: str, a: dict) -> str:
 async def _act_click(app: "AppContext", display: str, a: dict) -> str:
     button = a.get("button", "left")
     count = int(a.get("count", 1))
+    x, y = a.get("x"), a.get("y")
+    if x is not None and y is not None:
+        sx, sy = _scale_input(app.calibration, int(x), int(y))
+        await run_vm_cmd(app.ssh, _click_at_cmd(display, sx, sy, button, count))
+        return f"click {button} x{count} at ({int(x)}, {int(y)})"
     await run_vm_cmd(app.ssh, _click_cmd(display, button, count))
     return f"click {button} x{count}"
 
@@ -760,6 +879,23 @@ async def _act_move_mouse(app: "AppContext", display: str, a: dict) -> str:
     return f"move_mouse ({x}, {y}) [{mode}]"
 
 
+async def _act_scroll(app: "AppContext", display: str, a: dict) -> str:
+    direction = a.get("direction", "down")
+    amount = int(a.get("amount", 3))
+    await run_vm_cmd(app.ssh, _scroll_cmd(display, direction, amount))
+    return f"scroll {direction} x{max(1, amount)}"
+
+
+async def _act_drag(app: "AppContext", display: str, a: dict) -> str:
+    x1, y1 = int(a.get("x1", 0)), int(a.get("y1", 0))
+    x2, y2 = int(a.get("x2", 0)), int(a.get("y2", 0))
+    button = a.get("button", "left")
+    sx1, sy1 = _scale_input(app.calibration, x1, y1)
+    sx2, sy2 = _scale_input(app.calibration, x2, y2)
+    await run_vm_cmd(app.ssh, _drag_cmd(display, sx1, sy1, sx2, sy2, button))
+    return f"drag {button} ({x1}, {y1}) -> ({x2}, {y2})"
+
+
 async def _act_wait(app: "AppContext", display: str, a: dict) -> str:
     seconds = a.get("seconds", 0.5)
     await asyncio.sleep(seconds)
@@ -771,6 +907,8 @@ ACTION_HANDLERS = {
     "type_text": _act_type_text,
     "click": _act_click,
     "move_mouse": _act_move_mouse,
+    "scroll": _act_scroll,
+    "drag": _act_drag,
     "wait": _act_wait,
 }
 
@@ -795,8 +933,10 @@ async def run_actions(
     Supported actions:
     - {"action": "press_keys", "keys": ["Ctrl", "Shift", "p"]}
     - {"action": "type_text", "text": "hello"}
-    - {"action": "click", "button": "left", "count": 1}
+    - {"action": "click", "button": "left", "count": 1}  # optional "x"/"y"
     - {"action": "move_mouse", "x": 100, "y": 200, "mode": "absolute"}
+    - {"action": "scroll", "direction": "down", "amount": 3}
+    - {"action": "drag", "x1": 100, "y1": 200, "x2": 400, "y2": 200}
     - {"action": "wait", "seconds": 0.5}
 
     Example - switch to VS Code terminal reliably:
