@@ -17,20 +17,30 @@ from server import (
     ACTION_HANDLERS,
     DisplayCalibration,
     Project,
+    _act_activate_window,
     _act_click,
     _act_drag,
+    _act_key_down,
+    _act_key_up,
     _act_move_mouse,
+    _act_paste,
     _act_press_keys,
+    _act_screenshot,
     _act_scroll,
+    _act_set_clipboard,
     _act_type_text,
     _act_wait,
     _click_at_cmd,
     _click_cmd,
     _drag_cmd,
+    _key_event_cmd,
     _keys_cmd,
     _move_cmd,
     _parse_frame_extents,
     _run_type,
+    _activate_window,
+    _capture_screenshot,
+    _clipboard_set_cmd,
     _scale_input,
     _scale_output,
     _scroll_cmd,
@@ -43,20 +53,23 @@ DISPLAY_Q = "':0'"
 
 
 class FakeSSH:
-    """Records every ssh.run() invocation as (cmd, input)."""
+    """Records every ssh.run() invocation as (cmd, input).
 
-    def __init__(self):
+    *stdout* is returned for every command (default empty), enough for the
+    pure command-construction tests that don't depend on real output.
+    """
+
+    def __init__(self, stdout: str = ""):
         self.calls: list[tuple[str, str | None]] = []
+        self._stdout = stdout
 
     async def run(self, cmd, *, input=None, check=False):  # noqa: A002
         self.calls.append((cmd, input))
-
-        class _Result:
-            stdout = ""
-            stderr = ""
-            returncode = 0
-
-        return _Result()
+        return type(
+            "_Result",
+            (),
+            {"stdout": self._stdout, "stderr": "", "returncode": 0},
+        )()
 
 
 class FakeApp:
@@ -106,6 +119,22 @@ def test_keys_cmd_lowercases_and_joins():
 def test_keys_cmd_rejects_shell_metacharacters(bad):
     with pytest.raises(ValueError, match="Invalid key name"):
         _keys_cmd(DISPLAY_Q, [bad])
+
+
+@pytest.mark.parametrize("event", ["key", "keydown", "keyup"])
+def test_key_event_cmd_emits_each_event(event):
+    cmd = _key_event_cmd(DISPLAY_Q, ["Ctrl", "Shift"], event)
+    assert f"xdotool {event} ctrl+shift" in cmd
+
+
+def test_key_event_cmd_rejects_bad_event():
+    with pytest.raises(ValueError, match="key/keydown/keyup"):
+        _key_event_cmd(DISPLAY_Q, ["a"], "press")
+
+
+def test_key_event_cmd_validates_keys():
+    with pytest.raises(ValueError, match="Invalid key name"):
+        _key_event_cmd(DISPLAY_Q, ["a;b"], "keydown")
 
 
 def test_click_cmd_maps_buttons():
@@ -237,6 +266,12 @@ def test_action_handlers_registry_is_canonical_set():
         "move_mouse",
         "scroll",
         "drag",
+        "key_down",
+        "key_up",
+        "activate_window",
+        "screenshot",
+        "set_clipboard",
+        "paste",
         "wait",
     }
 
@@ -311,6 +346,108 @@ def test_act_press_keys_summary():
         _act_press_keys(FakeApp(ssh), DISPLAY_Q, {"keys": ["Ctrl", "a"]})
     )
     assert summary == "press_keys ['Ctrl', 'a']"
+
+
+def test_act_key_down_and_up():
+    ssh = FakeSSH()
+    down = asyncio.run(_act_key_down(FakeApp(ssh), DISPLAY_Q, {"keys": ["shift"]}))
+    up = asyncio.run(_act_key_up(FakeApp(ssh), DISPLAY_Q, {"keys": ["shift"]}))
+    assert down == "key_down ['shift']"
+    assert up == "key_up ['shift']"
+    assert any("xdotool keydown shift" in c for c in _cmds(ssh))
+    assert any("xdotool keyup shift" in c for c in _cmds(ssh))
+
+
+# ---------- activate_window ----------
+
+
+def test_activate_window_by_id_issues_windowactivate():
+    ssh = FakeSSH()
+    result = asyncio.run(_activate_window(ssh, window_id=42))
+    assert result.startswith("activated window 42:")
+    assert any("windowactivate --sync 42" in c for c in _cmds(ssh))
+    # window_id path must NOT run a search
+    assert all("xdotool search" not in c for c in _cmds(ssh))
+
+
+def test_activate_window_by_title_searches_then_activates():
+    ssh = FakeSSH(stdout="98765")  # search + getwindowname both return this
+    result = asyncio.run(_activate_window(ssh, title="Mousepad"))
+    assert "98765" in result
+    cmds = _cmds(ssh)
+    assert any("xdotool search --name" in c for c in cmds)
+    assert any("windowactivate --sync 98765" in c for c in cmds)
+
+
+def test_activate_window_no_match_raises():
+    ssh = FakeSSH(stdout="")  # search finds nothing
+    with pytest.raises(ValueError, match="no window matching"):
+        asyncio.run(_activate_window(ssh, title="Nonexistent"))
+
+
+def test_activate_window_requires_a_selector():
+    with pytest.raises(ValueError, match="provide either"):
+        asyncio.run(_activate_window(FakeSSH()))
+
+
+def test_act_activate_window_delegates():
+    ssh = FakeSSH()
+    result = asyncio.run(
+        _act_activate_window(FakeApp(ssh), DISPLAY_Q, {"window_id": 7})
+    )
+    assert result.startswith("activated window 7:")
+
+
+# ---------- screenshot as a batch action ----------
+
+
+def test_capture_screenshot_requires_project():
+    # app.project is None -> guard fires before any scrot/SFTP
+    with pytest.raises(ValueError, match="No project initialized"):
+        asyncio.run(_capture_screenshot(FakeApp(FakeSSH(), project=None)))
+
+
+def test_act_screenshot_requires_project():
+    with pytest.raises(ValueError, match="No project initialized"):
+        asyncio.run(_act_screenshot(FakeApp(FakeSSH(), project=None), DISPLAY_Q, {}))
+
+
+# ---------- clipboard / paste ----------
+
+
+def test_clipboard_set_cmd_uses_xclip_and_discards_output():
+    cmd = _clipboard_set_cmd(DISPLAY_Q)
+    assert "xclip -selection clipboard -in" in cmd
+    assert ">/dev/null 2>&1" in cmd
+
+
+def test_act_set_clipboard_pipes_text_via_stdin():
+    ssh = FakeSSH()
+    summary = asyncio.run(
+        _act_set_clipboard(FakeApp(ssh), DISPLAY_Q, {"text": "hello clip"})
+    )
+    assert summary == "set_clipboard (10 chars)"
+    # text must be passed as stdin input, never inline in the command
+    assert ("hello clip" in (inp or "") for _, inp in ssh.calls)
+    assert all("hello clip" not in cmd for cmd, _ in ssh.calls)
+
+
+def test_act_paste_with_text_sets_then_ctrl_v():
+    ssh = FakeSSH()
+    summary = asyncio.run(_act_paste(FakeApp(ssh), DISPLAY_Q, {"text": "payload"}))
+    assert summary == "paste (7 chars)"
+    cmds = _cmds(ssh)
+    assert any("xclip -selection clipboard -in" in c for c in cmds)
+    assert any("xdotool key ctrl+v" in c for c in cmds)
+
+
+def test_act_paste_without_text_only_ctrl_v():
+    ssh = FakeSSH()
+    summary = asyncio.run(_act_paste(FakeApp(ssh), DISPLAY_Q, {}))
+    assert summary == "paste"
+    cmds = _cmds(ssh)
+    assert all("xclip" not in c for c in cmds)
+    assert any("xdotool key ctrl+v" in c for c in cmds)
 
 
 def test_act_wait_summary():

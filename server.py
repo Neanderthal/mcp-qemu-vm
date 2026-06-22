@@ -55,13 +55,34 @@ def _type_cmd(display_q: str) -> str:
     )
 
 
-def _keys_cmd(display_q: str, keys: list[str]) -> str:
-    """Build an `xdotool key` command from a validated key list."""
+def _key_event_cmd(display_q: str, keys: list[str], event: str = "key") -> str:
+    """Build an xdotool key-event command from a validated key list.
+
+    *event* is one of ``key`` (press+release), ``keydown`` (hold), or
+    ``keyup`` (release). Key names are validated against VALID_KEY_PATTERN and
+    the combo is shlex-quoted, so shell metacharacters can't slip through.
+    """
+    if event not in ("key", "keydown", "keyup"):
+        raise ValueError("event must be key/keydown/keyup")
     for k in keys:
         if not VALID_KEY_PATTERN.match(k):
             raise ValueError(f"Invalid key name: {k!r}")
     combo = "+".join(k.lower() for k in keys)
-    return f"DISPLAY={display_q} xdotool key {shlex.quote(combo)}"
+    return f"DISPLAY={display_q} xdotool {event} {shlex.quote(combo)}"
+
+
+def _keys_cmd(display_q: str, keys: list[str]) -> str:
+    """Build an `xdotool key` (press+release) command from a key list."""
+    return _key_event_cmd(display_q, keys, "key")
+
+
+def _clipboard_set_cmd(display_q: str) -> str:
+    """Build the command that loads the X clipboard from stdin via xclip.
+
+    Text is piped in (never on the command line). xclip's stdout/stderr are
+    discarded so the forked selection owner doesn't hold the SSH channel open.
+    """
+    return f"DISPLAY={display_q} xclip -selection clipboard -in >/dev/null 2>&1"
 
 
 def _click_cmd(display_q: str, button: str, count: int) -> str:
@@ -788,6 +809,55 @@ async def type_text(
 
 
 @mcp.tool()
+async def set_clipboard(
+    text: str,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Load the VM clipboard with text (first VM layer's X clipboard).
+
+    Faster and more reliable than type_text() for large ASCII blobs. Follow
+    with paste() or press_keys(["Ctrl", "v"]) to insert it.
+
+    ⚠️ Clipboard redirection is often disabled across nested boundaries
+    (Citrix/RDP) — paste may not cross into inner sessions. See README
+    Known Issues #3.
+    """
+    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    display = shlex.quote(VM_DISPLAY)
+    # Text goes to xclip via stdin, never the shell
+    await ssh.run(_clipboard_set_cmd(display), input=text, check=True)
+    _log_tool_call(ctx, "set_clipboard", {"chars": len(text)})
+    return f"Clipboard set ({len(text)} chars)"
+
+
+@mcp.tool()
+async def paste(
+    text: str | None = None,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Paste with Ctrl+V, optionally setting the clipboard first.
+
+    If *text* is given, the clipboard is loaded with it and then pasted in one
+    call — a fast alternative to type_text() for big ASCII payloads. If omitted,
+    pastes whatever is already on the clipboard.
+
+    Note: terminals usually need Ctrl+Shift+V — use press_keys(["Ctrl",
+    "Shift", "v"]) there instead. Clipboard may not cross nested boundaries
+    (see README Known Issues #3).
+    """
+    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    display = shlex.quote(VM_DISPLAY)
+    if text is not None:
+        await ssh.run(_clipboard_set_cmd(display), input=text, check=True)
+    await run_vm_cmd(ssh, _keys_cmd(display, ["ctrl", "v"]))
+    set_note = f" ({len(text)} chars set)" if text is not None else ""
+    _log_tool_call(ctx, "paste", {"chars": len(text) if text is not None else 0})
+    return f"Pasted{set_note}"
+
+
+@mcp.tool()
 async def press_keys(
     keys: list[str],
     ctx: Context[ServerSession, AppContext] | None = None,
@@ -812,6 +882,110 @@ async def press_keys(
     await run_vm_cmd(ssh, cmd)
     result = f"Pressed keys: {keys}"
     _log_tool_call(ctx, "press_keys", {"keys": keys})
+    return result
+
+
+@mcp.tool()
+async def key_down(
+    keys: list[str],
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Hold down a key or modifier combo WITHOUT releasing it.
+
+    Pair with key_up() to bracket other actions — e.g. Shift-click to extend a
+    selection, or hold Ctrl while clicking several items:
+        key_down(["shift"]) → click(...) → key_up(["shift"])
+
+    ⚠️ Always release with key_up() — a stuck modifier corrupts later input.
+    Prefer press_keys() for a normal one-shot combo.
+    """
+    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    display = shlex.quote(VM_DISPLAY)
+    await run_vm_cmd(ssh, _key_event_cmd(display, keys, "keydown"))
+    _log_tool_call(ctx, "key_down", {"keys": keys})
+    return f"Holding keys: {keys}"
+
+
+@mcp.tool()
+async def key_up(
+    keys: list[str],
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Release a key or modifier combo previously held with key_down().
+    """
+    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    display = shlex.quote(VM_DISPLAY)
+    await run_vm_cmd(ssh, _key_event_cmd(display, keys, "keyup"))
+    _log_tool_call(ctx, "key_up", {"keys": keys})
+    return f"Released keys: {keys}"
+
+
+async def _activate_window(
+    ssh: asyncssh.SSHClientConnection,
+    *,
+    title: str | None = None,
+    window_id: int | None = None,
+) -> str:
+    """Activate (focus + raise) a window by title substring or window id.
+
+    Returns the activated window's id and name. Raises ValueError if neither
+    selector is given or no window matches the title. The title is treated as
+    an xdotool --name regex and is shlex-quoted, so it can't reach the shell.
+    """
+    display = shlex.quote(VM_DISPLAY)
+    if window_id is not None:
+        wid = str(int(window_id))
+    elif title:
+        # `|| true` so a no-match (xdotool exit 1) doesn't raise in run_vm_cmd
+        out = await run_vm_cmd(
+            ssh,
+            f"DISPLAY={display} xdotool search --name {shlex.quote(title)} || true",
+        )
+        matches = out.split()
+        if not matches:
+            raise ValueError(f"no window matching title {title!r}")
+        wid = matches[0]
+    else:
+        raise ValueError("provide either title or window_id")
+
+    name = await run_vm_cmd(
+        ssh,
+        f"DISPLAY={display} xdotool windowactivate --sync {wid} && "
+        f"DISPLAY={display} xdotool getwindowname {wid}",
+    )
+    return f"activated window {wid}: {name}"
+
+
+@mcp.tool()
+async def activate_window(
+    title: str | None = None,
+    window_id: int | None = None,
+    ctx: Context[ServerSession, AppContext] | None = None,
+) -> str:
+    """
+    Focus and raise a window by title (substring/regex) or X11 window id.
+
+    More reliable than clicking to switch focus (see the click warning). Use
+    get_active_window_info() or take_screenshot() to read window titles first.
+
+    Args:
+        title: Match against window names (xdotool --name regex). First match wins.
+        window_id: Exact X11 window id (from get_active_window_info).
+
+    Returns:
+        The activated window's id and name, or an error if nothing matched.
+    """
+    ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
+    try:
+        result = await _activate_window(ssh, title=title, window_id=window_id)
+    except ValueError as e:
+        _log_error(ctx, "activate_window", str(e))
+        return f"Error: {e}"
+    _log_tool_call(
+        ctx, "activate_window", {"title": title, "window_id": window_id}, result
+    )
     return result
 
 
@@ -896,6 +1070,43 @@ async def _act_drag(app: "AppContext", display: str, a: dict) -> str:
     return f"drag {button} ({x1}, {y1}) -> ({x2}, {y2})"
 
 
+async def _act_key_down(app: "AppContext", display: str, a: dict) -> str:
+    keys = a.get("keys", [])
+    await run_vm_cmd(app.ssh, _key_event_cmd(display, keys, "keydown"))
+    return f"key_down {keys}"
+
+
+async def _act_key_up(app: "AppContext", display: str, a: dict) -> str:
+    keys = a.get("keys", [])
+    await run_vm_cmd(app.ssh, _key_event_cmd(display, keys, "keyup"))
+    return f"key_up {keys}"
+
+
+async def _act_activate_window(app: "AppContext", display: str, a: dict) -> str:
+    return await _activate_window(
+        app.ssh, title=a.get("title"), window_id=a.get("window_id")
+    )
+
+
+async def _act_screenshot(app: "AppContext", display: str, a: dict) -> str:
+    _, sid = await _capture_screenshot(app)
+    return f"screenshot -> vm://screenshot/{sid}"
+
+
+async def _act_set_clipboard(app: "AppContext", display: str, a: dict) -> str:
+    text = a.get("text", "")
+    await app.ssh.run(_clipboard_set_cmd(display), input=text, check=True)
+    return f"set_clipboard ({len(text)} chars)"
+
+
+async def _act_paste(app: "AppContext", display: str, a: dict) -> str:
+    text = a.get("text")
+    if text is not None:
+        await app.ssh.run(_clipboard_set_cmd(display), input=text, check=True)
+    await run_vm_cmd(app.ssh, _keys_cmd(display, ["ctrl", "v"]))
+    return "paste" + (f" ({len(text)} chars)" if text is not None else "")
+
+
 async def _act_wait(app: "AppContext", display: str, a: dict) -> str:
     seconds = a.get("seconds", 0.5)
     await asyncio.sleep(seconds)
@@ -909,6 +1120,12 @@ ACTION_HANDLERS = {
     "move_mouse": _act_move_mouse,
     "scroll": _act_scroll,
     "drag": _act_drag,
+    "key_down": _act_key_down,
+    "key_up": _act_key_up,
+    "activate_window": _act_activate_window,
+    "screenshot": _act_screenshot,
+    "set_clipboard": _act_set_clipboard,
+    "paste": _act_paste,
     "wait": _act_wait,
 }
 
@@ -937,6 +1154,12 @@ async def run_actions(
     - {"action": "move_mouse", "x": 100, "y": 200, "mode": "absolute"}
     - {"action": "scroll", "direction": "down", "amount": 3}
     - {"action": "drag", "x1": 100, "y1": 200, "x2": 400, "y2": 200}
+    - {"action": "key_down", "keys": ["shift"]}
+    - {"action": "key_up", "keys": ["shift"]}
+    - {"action": "activate_window", "title": "Mousepad"}  # or "window_id"
+    - {"action": "screenshot"}
+    - {"action": "set_clipboard", "text": "hello"}
+    - {"action": "paste", "text": "hello"}  # "text" optional
     - {"action": "wait", "seconds": 0.5}
 
     Example - switch to VS Code terminal reliably:
@@ -1623,6 +1846,34 @@ Results: {info["result_count"]}"""
 # ---------- Screenshot tools + resources ----------
 
 
+async def _capture_screenshot(app_ctx: AppContext) -> tuple[pathlib.Path, str]:
+    """Capture a full-screen screenshot into the active project.
+
+    Runs scrot on the VM, downloads the PNG via SFTP, removes the remote temp
+    file, and returns (local_path, screenshot_id). Raises ValueError if no
+    project is active. Shared by take_screenshot() and the batch handler.
+    """
+    project = app_ctx.project
+    if project is None:
+        raise ValueError("No project initialized. Call project_init first.")
+    ssh = app_ctx.ssh
+
+    sid = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S-%f")
+    remote_path = f"/tmp/mcp-screenshot-{sid}.png"
+    display = shlex.quote(VM_DISPLAY)
+    await run_vm_cmd(ssh, f"DISPLAY={display} scrot {shlex.quote(remote_path)}")
+
+    local_path = project.screenshot_path(sid)
+    async with ssh.start_sftp_client() as sftp:
+        await sftp.get(remote_path, str(local_path))
+
+    # Remove the remote temp file so screenshots don't accumulate in /tmp.
+    await run_vm_cmd(ssh, f"rm -f {shlex.quote(remote_path)}")
+
+    project._log(f"Screenshot captured: {sid}")
+    return local_path, sid
+
+
 @mcp.tool()
 async def take_screenshot(
     ctx: Context[ServerSession, AppContext] | None = None,
@@ -1650,26 +1901,8 @@ async def take_screenshot(
         Screenshot path and resource URI for viewing
     """
     app_ctx = ctx.request_context.lifespan_context  # type: ignore[union-attr]
-    project = _get_project(ctx)  # type: ignore[arg-type]
-    ssh = app_ctx.ssh
-
-    sid = dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S-%f")
-    remote_path = f"/tmp/mcp-screenshot-{sid}.png"
-    display = shlex.quote(VM_DISPLAY)
-    cmd = f"DISPLAY={display} scrot {shlex.quote(remote_path)}"
-    await run_vm_cmd(ssh, cmd)
-
-    # download via SFTP to project folder
-    local_path = project.screenshot_path(sid)
-    async with ssh.start_sftp_client() as sftp:
-        await sftp.get(remote_path, str(local_path))
-
-    # Remove the remote temp file so screenshots don't accumulate in /tmp.
-    await run_vm_cmd(ssh, f"rm -f {shlex.quote(remote_path)}")
-
-    project._log(f"Screenshot captured: {sid}")
-    resource_uri = f"vm://screenshot/{sid}"
-    return f"Screenshot captured: {local_path}\nResource URI: {resource_uri}"
+    local_path, sid = await _capture_screenshot(app_ctx)
+    return f"Screenshot captured: {local_path}\nResource URI: vm://screenshot/{sid}"
 
 
 # Expose screenshots as resources
