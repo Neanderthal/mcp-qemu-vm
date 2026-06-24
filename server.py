@@ -3,6 +3,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import random
 import re
 import shlex
 import sys
@@ -56,13 +57,16 @@ MODIFIER_ALIASES = {
 # a shell command to run on the VM. Caller is responsible for execution.
 
 
-def _type_cmd(display_q: str) -> str:
+def _type_cmd(display_q: str, delay_ms: int = 10) -> str:
     """Build the `xdotool type` command. Text is piped via stdin (--file -),
     so it never touches the shell. LC_ALL forces a UTF-8 locale so non-ASCII
-    (Cyrillic, etc.) decodes correctly."""
+    (Cyrillic, etc.) decodes correctly. *delay_ms* is the inter-key delay; it is
+    cast to a non-negative int (defense-in-depth, never user text) and lets the
+    human-typing path vary cadence per word."""
+    delay = max(0, int(delay_ms))
     return (
         f"LC_ALL={shlex.quote(VM_LOCALE)} DISPLAY={display_q} "
-        "xdotool type --delay 10 --clearmodifiers --file -"
+        f"xdotool type --delay {delay} --clearmodifiers --file -"
     )
 
 
@@ -391,10 +395,89 @@ async def run_vm_cmd(
     return (result.stdout or "").strip()
 
 
+# ---------- Human-like typing ----------
+# The default fast path types every character with a fixed 10 ms xdotool
+# --delay, which reads as robotic. The human path instead varies the per-key
+# delay word-by-word and inserts pauses between words (longer after
+# clause/sentence punctuation), plus occasional random "hesitation" pauses, so
+# the rhythm never settles into a metronome. This gives a relaxed, lifelike
+# cadence (~3-6 chars/sec) that looks like a person thinking as they type. Text
+# still goes to xdotool via stdin (--file -), so it never touches the shell —
+# only the int delay is interpolated.
+
+HUMAN_KEY_DELAY_MS = (80, 220)        # per-key xdotool --delay, randomized per word
+HUMAN_WORD_PAUSE_S = (0.08, 0.28)     # pause after an ordinary word
+HUMAN_CLAUSE_PAUSE_S = (0.25, 0.55)   # pause after , ; :
+HUMAN_SENTENCE_PAUSE_S = (0.45, 0.95)  # pause after . ! ?
+HUMAN_HESITATION_CHANCE = 0.18        # odds of an extra "thinking" pause after a word
+HUMAN_HESITATION_S = (0.35, 0.90)     # size of that extra pause
+
+
+def _human_pause_after(chunk: str, rng: random.Random) -> float:
+    """Pick how long to pause after typing *chunk*.
+
+    The base pause depends on the last non-space character — longer after
+    sentence punctuation than a clause, longer after a clause than a plain word.
+    On top of that, with ``HUMAN_HESITATION_CHANCE`` odds an extra random
+    "thinking" pause is added so the rhythm stays irregular and alive.
+    """
+    stripped = chunk.rstrip()
+    last = stripped[-1] if stripped else ""
+    if last in ".!?":
+        lo, hi = HUMAN_SENTENCE_PAUSE_S
+    elif last in ",;:":
+        lo, hi = HUMAN_CLAUSE_PAUSE_S
+    else:
+        lo, hi = HUMAN_WORD_PAUSE_S
+    pause = rng.uniform(lo, hi)
+    if rng.random() < HUMAN_HESITATION_CHANCE:
+        pause += rng.uniform(*HUMAN_HESITATION_S)
+    return pause
+
+
+def _human_type_plan(line: str, rng: random.Random) -> list[tuple[str, int, float]]:
+    """Break a single (newline-free) line into ``(text, key_delay_ms,
+    pause_after_s)`` steps modelling relaxed, lifelike human typing.
+
+    Each word keeps its surrounding whitespace so the chunks concatenate back to
+    the exact line (indentation and spacing preserved). Every word gets its own
+    randomized inter-key delay; the trailing pause depends on the word's final
+    punctuation plus an occasional random hesitation. The last step never pauses
+    (no trailing dead time). Pure: all randomness comes from *rng*, so callers
+    can seed it for reproducible output.
+    """
+    chunks = re.findall(r"\s*\S+\s*", line)
+    if not chunks:  # all-whitespace (or empty) line: type it as a single chunk
+        chunks = [line]
+    plan: list[tuple[str, int, float]] = []
+    last = len(chunks) - 1
+    for i, chunk in enumerate(chunks):
+        delay = rng.randint(*HUMAN_KEY_DELAY_MS)
+        pause = 0.0 if i == last else _human_pause_after(chunk, rng)
+        plan.append((chunk, delay, pause))
+    return plan
+
+
+async def _type_line_human(
+    ssh: asyncssh.SSHClientConnection,
+    display_q: str,
+    line: str,
+    rng: random.Random,
+) -> None:
+    """Type one line with human cadence: per-word xdotool calls at varied delays
+    with pauses between them. Each chunk goes to xdotool via stdin."""
+    for chunk, delay_ms, pause_s in _human_type_plan(line, rng):
+        await ssh.run(_type_cmd(display_q, delay_ms), input=chunk, check=True)
+        if pause_s > 0:
+            await asyncio.sleep(pause_s)
+
+
 async def _run_type(
     ssh: asyncssh.SSHClientConnection,
     display_q: str,
     text: str,
+    human: bool = False,
+    rng: random.Random | None = None,
 ) -> None:
     """Type *text* into the VM, one line at a time.
 
@@ -404,17 +487,26 @@ async def _run_type(
     glyph instead of a paragraph break (README Known Issues #2). Splitting on
     newlines and pressing Return is robust in both terminals and rich editors.
 
+    With *human* set, each line is typed at a varied, medium-fast human cadence
+    (see ``_human_type_plan``); *rng* may be supplied for reproducibility,
+    otherwise a fresh ``random.Random`` is used.
+
     Each line's text still goes to xdotool via stdin (--file -), so it never
     touches the shell.
     """
     # Normalise CRLF / CR so we only split on \n.
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     segments = normalized.split("\n")
+    if rng is None:
+        rng = random.Random()
     type_cmd = _type_cmd(display_q)
     return_cmd = f"DISPLAY={display_q} xdotool key Return"
     for idx, segment in enumerate(segments):
         if segment:
-            await ssh.run(type_cmd, input=segment, check=True)
+            if human:
+                await _type_line_human(ssh, display_q, segment, rng)
+            else:
+                await ssh.run(type_cmd, input=segment, check=True)
         if idx < len(segments) - 1:
             await run_vm_cmd(ssh, return_cmd)
 
@@ -1391,6 +1483,7 @@ async def drag(
 @mcp.tool()
 async def type_text(
     text: str,
+    human: bool = False,
     ctx: Context[ServerSession, AppContext] | None = None,
 ) -> str:
     """
@@ -1403,18 +1496,26 @@ async def type_text(
     - Vim mode in status bar (INSERT/NORMAL) = DO NOT type commands
     - No cursor visible = STOP and screenshot first
 
-    The text is typed with 10ms delay between characters for reliability.
+    By default text is typed fast (10ms between characters) for reliability.
+    Set *human* to type at a relaxed, lifelike cadence instead: the per-key
+    speed varies word-by-word with pauses between words (longer after
+    punctuation) and occasional random hesitations, so the rhythm never settles
+    into a metronome and looks like a person thinking as they type. Human mode is
+    noticeably slower and makes one keystroke-stream per word — prefer it for
+    realism (chat boxes, demos), keep the default for speed (commands, payloads).
+
     Newlines are sent as explicit Return key presses (not a literal LF), so
     multi-line text produces real line breaks in both terminals and rich editors.
     """
     ssh = ctx.request_context.lifespan_context.ssh  # type: ignore[union-attr]
     # Text goes to stdin via --file -, never touches the shell
     display = shlex.quote(VM_DISPLAY)
-    await _run_type(ssh, display, text)
+    await _run_type(ssh, display, text, human=human)
     # Mask sensitive text in logs (only show length)
     log_text = text if len(text) <= 20 else f"{text[:10]}...({len(text)} chars)"
-    _log_tool_call(ctx, "type_text", {"text": log_text})
-    return f"Typed {len(text)} characters"
+    _log_tool_call(ctx, "type_text", {"text": log_text, "human": human})
+    mode = "human" if human else "fast"
+    return f"Typed {len(text)} characters ({mode})"
 
 
 @mcp.tool()
@@ -1637,7 +1738,8 @@ async def _act_press_keys(app: "AppContext", display: str, a: dict) -> str:
 
 async def _act_type_text(app: "AppContext", display: str, a: dict) -> str:
     text = a.get("text", "")
-    await _run_type(app.ssh, display, text)
+    human = bool(a.get("human", False))
+    await _run_type(app.ssh, display, text, human=human)
     return f"type_text ({len(text)} chars)"
 
 
@@ -1779,7 +1881,7 @@ async def run_actions(
 
     Supported actions:
     - {"action": "press_keys", "keys": ["Ctrl", "Shift", "p"]}
-    - {"action": "type_text", "text": "hello"}
+    - {"action": "type_text", "text": "hello"}  # optional "human": true cadence
     - {"action": "click", "button": "left", "count": 1}  # optional "x"/"y"
     - {"action": "move_mouse", "x": 100, "y": 200, "mode": "absolute"}
     - {"action": "scroll", "direction": "down", "amount": 3}

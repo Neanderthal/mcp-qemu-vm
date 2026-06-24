@@ -311,9 +311,11 @@ Projects organize all outputs (screenshots, logs, results, advice) into timestam
 |------|-------------|
 | `move_mouse(x, y, mode)` | Move cursor (mode: "absolute" or "relative") |
 | `click(button, count, x, y)` | Click a button; optional `x, y` move-and-click in one op |
+| `click_in_window(x, y, button, count)` | Click at coords relative to the active window's client area |
+| `get_active_window_info()` | Active window id, title, position & geometry |
 | `scroll(direction, amount)` | Mouse-wheel scroll (up/down/left/right) at cursor |
 | `drag(x1, y1, x2, y2, button)` | Press at start, drag to end, release (select/slider/DnD) |
-| `type_text(text)` | Type text (newlines → Return, UTF-8 safe) |
+| `type_text(text, human)` | Type text (newlines → Return, UTF-8 safe); `human=True` types at a slower, lifelike cadence (varied per-word speed + random pauses) |
 | `press_keys(keys)` | Press key combo, e.g., `["Ctrl", "L"]` |
 | `key_down(keys)` / `key_up(keys)` | Hold / release a key or modifier (e.g. Shift-click) |
 | `set_clipboard(text)` | Load the VM clipboard (fast insert for big ASCII) |
@@ -412,6 +414,14 @@ uv pip install pillow pytesseract
 | `take_screenshot()` | Capture screenshot (requires active project) |
 
 Screenshots are saved to the project's `screenshots/` folder and exposed as MCP resources at `vm://screenshot/{id}`.
+
+### Display Calibration
+
+| Tool | Description |
+|------|-------------|
+| `display_calibration_info(recalibrate)` | Show the xdotool↔screenshot scale factors; `recalibrate=True` re-probes them |
+
+Scale factors are auto-detected at startup (HiDPI/scaling mismatches); coordinate tools apply them transparently.
 
 ## Typical Workflow
 

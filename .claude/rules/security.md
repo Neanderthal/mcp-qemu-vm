@@ -5,7 +5,7 @@
 All xdotool/scrot commands run over SSH. User-supplied values must never be interpolated directly into shell commands.
 
 ### type_text()
-Uses `xdotool type --file -` with text piped to stdin. Text never touches the shell. Do NOT revert to shell escaping.
+Uses `xdotool type --file -` with text piped to stdin. Text never touches the shell. Do NOT revert to shell escaping. The `human=True` cadence mode types word-by-word with a per-word `--delay <int>`; the delay is always `max(0, int(...))` (never user text), so nothing user-controlled is interpolated.
 
 ### press_keys()
 Key names are validated against `VALID_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")` before use. The key combo is `shlex.quote()`d. Rejects `;`, `$`, backticks, pipes.
