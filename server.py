@@ -398,21 +398,29 @@ async def run_vm_cmd(
 # ---------- Human-like typing ----------
 # The default fast path types every character with a fixed 10 ms xdotool
 # --delay, which reads as robotic. The human path instead varies the per-key
-# delay word-by-word and inserts brief pauses between words (longer after
-# clause/sentence punctuation), giving a medium-fast cadence (~5-9 chars/sec)
-# that looks like a person typing. Text still goes to xdotool via stdin
-# (--file -), so it never touches the shell — only the int delay is interpolated.
+# delay word-by-word and inserts pauses between words (longer after
+# clause/sentence punctuation), plus occasional random "hesitation" pauses, so
+# the rhythm never settles into a metronome. This gives a relaxed, lifelike
+# cadence (~3-6 chars/sec) that looks like a person thinking as they type. Text
+# still goes to xdotool via stdin (--file -), so it never touches the shell —
+# only the int delay is interpolated.
 
-HUMAN_KEY_DELAY_MS = (45, 120)        # per-key xdotool --delay, randomized per word
-HUMAN_WORD_PAUSE_S = (0.03, 0.12)     # pause after an ordinary word
-HUMAN_CLAUSE_PAUSE_S = (0.12, 0.28)   # pause after , ; :
-HUMAN_SENTENCE_PAUSE_S = (0.25, 0.50)  # pause after . ! ?
+HUMAN_KEY_DELAY_MS = (80, 220)        # per-key xdotool --delay, randomized per word
+HUMAN_WORD_PAUSE_S = (0.08, 0.28)     # pause after an ordinary word
+HUMAN_CLAUSE_PAUSE_S = (0.25, 0.55)   # pause after , ; :
+HUMAN_SENTENCE_PAUSE_S = (0.45, 0.95)  # pause after . ! ?
+HUMAN_HESITATION_CHANCE = 0.18        # odds of an extra "thinking" pause after a word
+HUMAN_HESITATION_S = (0.35, 0.90)     # size of that extra pause
 
 
 def _human_pause_after(chunk: str, rng: random.Random) -> float:
-    """Pick how long to pause after typing *chunk*, based on its last
-    non-space character: longer after sentence punctuation than after a clause,
-    longer after a clause than a plain word."""
+    """Pick how long to pause after typing *chunk*.
+
+    The base pause depends on the last non-space character — longer after
+    sentence punctuation than a clause, longer after a clause than a plain word.
+    On top of that, with ``HUMAN_HESITATION_CHANCE`` odds an extra random
+    "thinking" pause is added so the rhythm stays irregular and alive.
+    """
     stripped = chunk.rstrip()
     last = stripped[-1] if stripped else ""
     if last in ".!?":
@@ -421,18 +429,22 @@ def _human_pause_after(chunk: str, rng: random.Random) -> float:
         lo, hi = HUMAN_CLAUSE_PAUSE_S
     else:
         lo, hi = HUMAN_WORD_PAUSE_S
-    return rng.uniform(lo, hi)
+    pause = rng.uniform(lo, hi)
+    if rng.random() < HUMAN_HESITATION_CHANCE:
+        pause += rng.uniform(*HUMAN_HESITATION_S)
+    return pause
 
 
 def _human_type_plan(line: str, rng: random.Random) -> list[tuple[str, int, float]]:
     """Break a single (newline-free) line into ``(text, key_delay_ms,
-    pause_after_s)`` steps modelling medium-fast human typing.
+    pause_after_s)`` steps modelling relaxed, lifelike human typing.
 
     Each word keeps its surrounding whitespace so the chunks concatenate back to
     the exact line (indentation and spacing preserved). Every word gets its own
     randomized inter-key delay; the trailing pause depends on the word's final
-    punctuation. The last step never pauses (no trailing dead time). Pure: all
-    randomness comes from *rng*, so callers can seed it for reproducible output.
+    punctuation plus an occasional random hesitation. The last step never pauses
+    (no trailing dead time). Pure: all randomness comes from *rng*, so callers
+    can seed it for reproducible output.
     """
     chunks = re.findall(r"\s*\S+\s*", line)
     if not chunks:  # all-whitespace (or empty) line: type it as a single chunk
@@ -1485,11 +1497,12 @@ async def type_text(
     - No cursor visible = STOP and screenshot first
 
     By default text is typed fast (10ms between characters) for reliability.
-    Set *human* to type at a medium-fast human cadence instead: the per-key
-    speed varies word-by-word with brief pauses between words (longer after
-    punctuation), so it looks like a person typing. Human mode is slower and
-    makes one keystroke-stream per word — prefer it for realism (chat boxes,
-    demos), keep the default for speed (commands, large payloads).
+    Set *human* to type at a relaxed, lifelike cadence instead: the per-key
+    speed varies word-by-word with pauses between words (longer after
+    punctuation) and occasional random hesitations, so the rhythm never settles
+    into a metronome and looks like a person thinking as they type. Human mode is
+    noticeably slower and makes one keystroke-stream per word — prefer it for
+    realism (chat boxes, demos), keep the default for speed (commands, payloads).
 
     Newlines are sent as explicit Return key presses (not a literal LF), so
     multi-line text produces real line breaks in both terminals and rich editors.

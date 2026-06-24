@@ -341,6 +341,23 @@ def test_human_type_plan_pauses_longer_after_sentence_punctuation():
     assert sentence_plan[0][2] >= server.HUMAN_SENTENCE_PAUSE_S[0]
 
 
+def test_human_type_plan_adds_random_hesitation_pauses():
+    # Plain words only (no punctuation): the only way a pause can exceed the
+    # ordinary word-pause ceiling is a random hesitation being added.
+    line = " ".join(["word"] * 60)
+    plan = _human_type_plan(line, _seeded())
+    inter_word = [pause for _, _, pause in plan[:-1]]
+    assert any(pause > server.HUMAN_WORD_PAUSE_S[1] for pause in inter_word)
+    # ...but most words still get only the small base pause (hesitation is rare)
+    plain = [p for p in inter_word if p <= server.HUMAN_WORD_PAUSE_S[1]]
+    assert len(plain) > len(inter_word) / 2
+
+
+def test_human_typing_is_slower_than_fast_default():
+    # The whole point: human cadence must be meaningfully slower per key.
+    assert min(server.HUMAN_KEY_DELAY_MS) > 10
+
+
 def test_human_type_plan_empty_line_yields_single_empty_chunk():
     plan = _human_type_plan("", _seeded())
     assert len(plan) == 1
