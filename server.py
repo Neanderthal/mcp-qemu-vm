@@ -37,6 +37,17 @@ VALID_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
 BUTTON_MAP = {"left": 1, "middle": 2, "right": 3}
 # Mouse-wheel scroll directions map to xdotool button numbers
 SCROLL_BUTTONS = {"up": 4, "down": 5, "left": 6, "right": 7}
+# Modifier names -> xdotool's lowercase aliases (accepted in any case here)
+MODIFIER_ALIASES = {
+    "ctrl": "ctrl",
+    "control": "ctrl",
+    "shift": "shift",
+    "alt": "alt",
+    "super": "super",
+    "win": "super",
+    "meta": "super",
+    "cmd": "super",
+}
 
 
 # ---------- xdotool command builders ----------
@@ -55,19 +66,39 @@ def _type_cmd(display_q: str) -> str:
     )
 
 
+def _normalize_key(k: str) -> str:
+    """Normalise one key for xdotool.
+
+    X keysyms are case-sensitive: ``Page_Up``/``Prior``/``Home``/``Return``/``F4``
+    are valid but their lowercase forms are *silently ignored* by xdotool. So we
+    only fold case where it is safe:
+    - modifier names -> xdotool's lowercase alias (Ctrl -> ctrl, Win -> super)
+    - single characters -> lowercase (so ["Ctrl", "L"] means ctrl+l, not
+      ctrl+shift+l)
+    - everything else (named keysyms) is passed through unchanged.
+    """
+    low = k.lower()
+    if low in MODIFIER_ALIASES:
+        return MODIFIER_ALIASES[low]
+    if len(k) == 1:
+        return low
+    return k
+
+
 def _key_event_cmd(display_q: str, keys: list[str], event: str = "key") -> str:
     """Build an xdotool key-event command from a validated key list.
 
     *event* is one of ``key`` (press+release), ``keydown`` (hold), or
     ``keyup`` (release). Key names are validated against VALID_KEY_PATTERN and
     the combo is shlex-quoted, so shell metacharacters can't slip through.
+    Named keysyms keep their case (see _normalize_key) so Page_Up etc. work.
     """
     if event not in ("key", "keydown", "keyup"):
         raise ValueError("event must be key/keydown/keyup")
     for k in keys:
         if not VALID_KEY_PATTERN.match(k):
             raise ValueError(f"Invalid key name: {k!r}")
-    combo = "+".join(k.lower() for k in keys)
+    combo = "+".join(_normalize_key(k) for k in keys)
     return f"DISPLAY={display_q} xdotool {event} {shlex.quote(combo)}"
 
 
