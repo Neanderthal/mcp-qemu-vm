@@ -32,6 +32,7 @@ from server import (
     _act_type_text,
     _act_wait,
     _activate_window,
+    _build_marks,
     _capture_screenshot,
     _click_at_cmd,
     _click_cmd,
@@ -43,6 +44,7 @@ from server import (
     _match_text_boxes,
     _move_cmd,
     _parse_frame_extents,
+    _render_marks,
     _run_type,
     _scale_input,
     _scale_output,
@@ -749,6 +751,48 @@ def test_crop_zoom_produces_magnified_png_and_region():
     assert (region.left, region.top, region.crop_w, region.crop_h) == (30, 30, 40, 20)
     out = Image.open(io.BytesIO(zbytes))
     assert out.size == (80, 40)  # 40*2 x 20*2
+
+
+# ---------- Set-of-Mark (numbered overlays) ----------
+
+
+def test_build_marks_assigns_ids_in_reading_order():
+    words = [
+        _w("Zeta", 100, 300, conf=90),  # lower on screen
+        _w("Alpha", 50, 40, conf=90),  # top of screen
+    ]
+    marks = _build_marks(words, min_conf=50)
+    assert [m["text"] for m in marks] == ["Alpha", "Zeta"]
+    assert [m["id"] for m in marks] == [0, 1]
+    # center computed from box
+    assert (marks[0]["cx"], marks[0]["cy"]) == (50 + 20, 40 + 10)
+
+
+def test_build_marks_filters_low_confidence():
+    words = [_w("keep", 0, 0, conf=80), _w("drop", 0, 30, conf=20)]
+    marks = _build_marks(words, min_conf=50)
+    assert [m["text"] for m in marks] == ["keep"]
+
+
+def test_build_marks_caps_at_max_marks():
+    words = [_w(f"w{i}", 0, i * 10, conf=90) for i in range(10)]
+    assert len(_build_marks(words, min_conf=50, max_marks=3)) == 3
+
+
+def test_render_marks_returns_same_size_png():
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (200, 100), (255, 255, 255)).save(buf, format="PNG")
+    marks = [
+        {"id": 0, "text": "OK", "left": 10, "top": 20, "width": 30, "height": 12,
+         "cx": 25, "cy": 26}
+    ]
+    out_bytes = _render_marks(buf.getvalue(), marks)
+    out = Image.open(io.BytesIO(out_bytes))
+    assert out.size == (200, 100)
 
 
 async def check_connection() -> bool:
