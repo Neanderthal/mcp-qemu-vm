@@ -313,7 +313,7 @@ Projects organize all outputs (screenshots, logs, results, advice) into timestam
 | `click(button, count, x, y)` | Click a button; optional `x, y` move-and-click in one op |
 | `scroll(direction, amount)` | Mouse-wheel scroll (up/down/left/right) at cursor |
 | `drag(x1, y1, x2, y2, button)` | Press at start, drag to end, release (select/slider/DnD) |
-| `type_text(text, human)` | Type text (newlines → Return, UTF-8 safe); `human=True` for medium-fast human cadence |
+| `type_text(text, human)` | Type text (newlines → Return, UTF-8 safe); `human=True` types at a slower, lifelike cadence (varied per-word speed + random pauses) |
 | `press_keys(keys)` | Press key combo, e.g., `["Ctrl", "L"]` |
 | `key_down(keys)` / `key_up(keys)` | Hold / release a key or modifier (e.g. Shift-click) |
 | `set_clipboard(text)` | Load the VM clipboard (fast insert for big ASCII) |
