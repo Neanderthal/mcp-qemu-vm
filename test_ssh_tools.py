@@ -39,6 +39,7 @@ from server import (
     _clipboard_set_cmd,
     _crop_zoom,
     _drag_cmd,
+    _human_type_plan,
     _key_event_cmd,
     _keys_cmd,
     _match_text_boxes,
@@ -291,6 +292,100 @@ def test_run_type_never_sends_literal_newline_to_xdotool():
     ssh = FakeSSH()
     asyncio.run(_run_type(ssh, DISPLAY_Q, "first\nsecond"))
     assert all("\n" not in (inp or "") for _, inp in ssh.calls)
+
+
+# ---------- human-like typing ----------
+
+
+def _seeded():
+    import random
+
+    return random.Random(1234)
+
+
+def test_type_cmd_accepts_custom_delay():
+    cmd = _type_cmd(DISPLAY_Q, 80)
+    assert "xdotool type --delay 80 --clearmodifiers --file -" in cmd
+
+
+def test_type_cmd_delay_is_clamped_and_cast():
+    # negative -> 0, float-ish -> int (defense-in-depth, never user text)
+    assert "--delay 0 " in _type_cmd(DISPLAY_Q, -5)
+    assert "--delay 7 " in _type_cmd(DISPLAY_Q, 7.9)
+
+
+def test_human_type_plan_reconstructs_line_exactly():
+    line = "  hello   brave   new  world  "
+    plan = _human_type_plan(line, _seeded())
+    assert "".join(text for text, _, _ in plan) == line
+
+
+def test_human_type_plan_delays_within_band():
+    plan = _human_type_plan("the quick brown fox jumps", _seeded())
+    lo, hi = server.HUMAN_KEY_DELAY_MS
+    assert all(lo <= delay <= hi for _, delay, _ in plan)
+
+
+def test_human_type_plan_last_step_has_no_pause():
+    plan = _human_type_plan("alpha beta gamma", _seeded())
+    assert plan[-1][2] == 0.0
+    # earlier steps do pause
+    assert all(pause > 0 for _, _, pause in plan[:-1])
+
+
+def test_human_type_plan_pauses_longer_after_sentence_punctuation():
+    # Same seed for both so only the punctuation differs.
+    word_plan = _human_type_plan("done next", _seeded())
+    sentence_plan = _human_type_plan("done. next", _seeded())
+    assert sentence_plan[0][2] > word_plan[0][2]
+    assert sentence_plan[0][2] >= server.HUMAN_SENTENCE_PAUSE_S[0]
+
+
+def test_human_type_plan_empty_line_yields_single_empty_chunk():
+    plan = _human_type_plan("", _seeded())
+    assert len(plan) == 1
+    text, _, pause = plan[0]
+    assert text == "" and pause == 0.0
+
+
+def test_run_type_human_types_per_word_with_varied_delays(monkeypatch):
+    async def _no_sleep(_):
+        return None
+
+    monkeypatch.setattr(server.asyncio, "sleep", _no_sleep)
+    ssh = FakeSSH()
+    asyncio.run(_run_type(ssh, DISPLAY_Q, "one two three", human=True))
+    # one xdotool type call per word, text reconstructs the line
+    type_calls = [(cmd, inp) for cmd, inp in ssh.calls if "xdotool type" in cmd]
+    assert len(type_calls) == 3
+    assert "".join(inp for _, inp in type_calls) == "one two three"
+    # delays vary per word (not all the fixed default)
+    assert any("--delay 10 " not in cmd for cmd, _ in type_calls)
+
+
+def test_run_type_human_presses_return_between_lines(monkeypatch):
+    async def _no_sleep(_):
+        return None
+
+    monkeypatch.setattr(server.asyncio, "sleep", _no_sleep)
+    ssh = FakeSSH()
+    asyncio.run(_run_type(ssh, DISPLAY_Q, "line1\nline2", human=True))
+    returns = [cmd for cmd, _ in ssh.calls if "xdotool key Return" in cmd]
+    assert len(returns) == 1
+    assert all("\n" not in (inp or "") for _, inp in ssh.calls)
+
+
+def test_act_type_text_passes_human_flag(monkeypatch):
+    async def _no_sleep(_):
+        return None
+
+    monkeypatch.setattr(server.asyncio, "sleep", _no_sleep)
+    ssh = FakeSSH()
+    action = {"text": "hi there", "human": True}
+    asyncio.run(_act_type_text(FakeApp(ssh), DISPLAY_Q, action))
+    type_calls = [cmd for cmd, _ in ssh.calls if "xdotool type" in cmd]
+    # two words -> two per-word type calls (human cadence engaged)
+    assert len(type_calls) == 2
 
 
 # ---------- run_actions batch dispatch (ACTION_HANDLERS registry) ----------
